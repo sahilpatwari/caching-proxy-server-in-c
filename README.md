@@ -1,2 +1,2 @@
-# caching-proxy-server-in-c
+# Caching-proxy-server-in-c
 A Caching Proxy Server Implementation in C
