@@ -47,13 +47,40 @@ void* handle_client(void* args) {
             return NULL;
         }
     }
-    struct ProxyRequest *req;
-    printf("%s\n",url);
-    if(parse_url(url,req) == 0) {
+    struct ProxyRequest req;
+    if(parse_url(url,&req) == 0) {
          printf("Proxy Request Detected\n");
-         printf("Target Host: %s\n",req->hostname);
-         printf("Port: %d\n",req->port);
-         printf("Path: %s\n",req->path);
+         printf("Target Host: %s\n",req.hostname);
+         printf("Port: %d\n",req.port);
+         printf("Path: %s\n",req.path);
+
+         int serverfd = connect_to_host(req.hostname,req.port);
+         if(serverfd == -1) {
+            char* err_msg = "HTTP 502 Bad Gateway\r\n\r\nConnection Failed";
+            send(newfd,err_msg,strlen(err_msg),0);
+         } else {
+            char test_req[8192];
+            snprintf(test_req,sizeof(test_req),
+            "GET %s HTTP/1.1\r\nHost:%s\r\nConnection:close\r\n\r\n"
+            ,req.path,req.hostname);
+
+            if(send(serverfd,test_req,strlen(test_req),0) == -1) {
+                perror("send");
+                close(serverfd);
+                return NULL;
+            }
+            char remote_buffer[8192];
+            int n = recv(serverfd,remote_buffer,sizeof(remote_buffer) - 1,0);
+            if(n > 0) {
+                remote_buffer[n] = '\0';
+                printf("Received response back from host %s\n",req.hostname);
+                send(newfd,remote_buffer,sizeof(remote_buffer),0);
+            }
+            close(serverfd);
+
+         }
+
+
     } else {
         printf("Invalid URL Format\n");
     }
@@ -92,12 +119,12 @@ int main() {
         }
         break;
     }
-    
+    freeaddrinfo(res);
     if(p == NULL) {
         fprintf(stderr,"Server couldn't bind to a specific port");
         exit(1);
     }
-    freeaddrinfo(res);
+   
     if(listen(sockfd,BACKLOG) == -1) {
         perror("listen");
         exit(1);
@@ -114,7 +141,7 @@ int main() {
         if(!args) {
             perror("malloc");
             close(newfd);
-            return 0;
+            continue;
         }
 
         args->client_fd = newfd;

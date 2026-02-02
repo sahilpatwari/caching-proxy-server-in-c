@@ -8,5 +8,6 @@ struct ProxyRequest {
 };
 
 int parse_url(char*,struct ProxyRequest*);
+int connect_to_host(char*,int);
 
 #endif

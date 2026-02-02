@@ -6,10 +6,8 @@
 int parse_url(char* url , struct ProxyRequest *req) {
     req->port = 80;
     req->path[0] = '\0';
-    printf("%d\n",req->port);
     char *host_start = url,*path_start;
-    printf("%s\n",host_start);
-    if(strncmp(url,"http://",7)) {
+    if(strncmp(url,"http://",7) == 0) {
         host_start += 7;
     }
 
@@ -20,7 +18,6 @@ int parse_url(char* url , struct ProxyRequest *req) {
     } else {
         host_len = path_start - host_start;
     }
-    printf("%d\n",host_len);
     if(host_len > 1023) return -1;
     strncpy(req->hostname,host_start,host_len);
     req->hostname[host_len] = '\0';
