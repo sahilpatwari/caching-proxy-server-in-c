@@ -1,0 +1,131 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<sys/socket.h>
+#include<sys/types.h>
+#include<arpa/inet.h>
+#include<netdb.h>
+#include<netinet/in.h>
+#include<pthread.h>
+#include<unistd.h>
+#include<string.h>
+
+#include"proxy.h"
+#define PORT "3490"
+#define BACKLOG 10
+#define BUFFER 8192
+
+typedef struct {
+    int client_fd;
+}thread_args_t;
+
+
+void* handle_client(void* args) {
+    thread_args_t *thread_args = (thread_args_t*)args;
+    int newfd = thread_args->client_fd;
+    free(thread_args);
+    char buffer[BUFFER];
+    printf("Client Connected\n");
+    int bytes_received = recv(newfd,buffer,BUFFER - 1,0);
+    if(bytes_received < 0) {
+        perror("recieve");
+        close(newfd);
+        return NULL;
+    }
+    buffer[bytes_received] = '\0';
+    const char* response;
+    char method[16],url[5120],protocol[16];
+    int count = sscanf(buffer,"%15s %5119s %15s",method,url,protocol);
+    if(count != 3) {
+        fprintf(stderr,"Unknown Error in Parsing the Request");
+        response = "HTTP/1.1 500 Internal Server Error\r\n"
+                "\r\n"
+                "Internal Server Error";
+        
+        if(send(newfd,response,strlen(response),0) == -1) {
+            perror("send");
+            close(newfd);
+            return NULL;
+        }
+    }
+    struct ProxyRequest *req;
+    printf("%s\n",url);
+    if(parse_url(url,req) == 0) {
+         printf("Proxy Request Detected\n");
+         printf("Target Host: %s\n",req->hostname);
+         printf("Port: %d\n",req->port);
+         printf("Path: %s\n",req->path);
+    } else {
+        printf("Invalid URL Format\n");
+    }
+    return NULL;
+}
+int main() {
+    struct sockaddr_storage their_addr;
+    struct addrinfo hints, *res, *p;
+    socklen_t sin_size;
+    int status, sockfd,newfd,yes = 1;
+
+    memset(&hints,0,sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    if((status = getaddrinfo(NULL,PORT,&hints,&res)) == -1) {
+        fprintf(stderr,"getaddrinfo: %s\n",gai_strerror(status));
+        return 1;
+    }
+
+    for(p = res;p != NULL;p = p->ai_next) {
+        if((sockfd = socket(p->ai_family,p->ai_socktype,p->ai_protocol)) == -1) {
+              perror("socket");
+              continue;
+        }
+
+         if(setsockopt(sockfd,SOL_SOCKET, SO_REUSEADDR,&yes,sizeof(int)) == -1) {
+            perror("setsocketopt");
+            exit(1);
+        }
+
+        if(bind(sockfd,p->ai_addr,p->ai_addrlen) == -1) {
+            perror("bind");
+            continue;
+        }
+        break;
+    }
+    
+    if(p == NULL) {
+        fprintf(stderr,"Server couldn't bind to a specific port");
+        exit(1);
+    }
+    freeaddrinfo(res);
+    if(listen(sockfd,BACKLOG) == -1) {
+        perror("listen");
+        exit(1);
+    }
+    printf("Server is listening\n");
+    while(1) {
+        sin_size = sizeof their_addr;
+        newfd = accept(sockfd,(struct sockaddr*)&their_addr,&sin_size);
+        if(newfd == -1) {
+            perror("accept");
+            continue;
+        }
+        thread_args_t *args = malloc(sizeof(thread_args_t));
+        if(!args) {
+            perror("malloc");
+            close(newfd);
+            return 0;
+        }
+
+        args->client_fd = newfd;
+        pthread_t pid;
+        if(pthread_create(&pid,NULL,handle_client,(void*)args) != 0) {
+            free(args);
+            close(newfd);
+        } else {
+            pthread_detach(pid);
+        }
+
+    }
+    return 0;
+}
