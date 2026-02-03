@@ -59,23 +59,28 @@ void* handle_client(void* args) {
             char* err_msg = "HTTP 502 Bad Gateway\r\n\r\nConnection Failed";
             send(newfd,err_msg,strlen(err_msg),0);
          } else {
-            char test_req[8192];
-            snprintf(test_req,sizeof(test_req),
-            "GET %s HTTP/1.1\r\nHost:%s\r\nConnection:close\r\n\r\n"
-            ,req.path,req.hostname);
+            char new_req[8192];
+            snprintf(new_req,sizeof(new_req),
+            "%s %s %s\r\nHost: %s\r\nConnection: close\r\n\r\n"
+            ,method,req.path,protocol,req.hostname);
+            
+            printf("Forwarding Request\n");
 
-            if(send(serverfd,test_req,strlen(test_req),0) == -1) {
-                perror("send");
+            if(send(serverfd,new_req,strlen(new_req),0) == -1) {
+                perror("send to server");
                 close(serverfd);
                 return NULL;
             }
             char remote_buffer[8192];
-            int n = recv(serverfd,remote_buffer,sizeof(remote_buffer) - 1,0);
-            if(n > 0) {
+            int n, total_bytes = 0;
+            while((n =  recv(serverfd,remote_buffer,sizeof(remote_buffer) - 1,0)) > 0) {
                 remote_buffer[n] = '\0';
-                printf("Received response back from host %s\n",req.hostname);
-                send(newfd,remote_buffer,sizeof(remote_buffer),0);
+                send(newfd,remote_buffer,n,0);
+                total_bytes += n;
             }
+            
+            printf("Total Number of Bytes relayed back to the client: %d\n",total_bytes);
+
             close(serverfd);
 
          }
