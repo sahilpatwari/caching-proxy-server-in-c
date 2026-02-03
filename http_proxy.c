@@ -10,6 +10,7 @@
 #include<string.h>
 
 #include"proxy.h"
+#include"cache.h"
 #define PORT "3490"
 #define BACKLOG 10
 #define BUFFER 8192
@@ -53,7 +54,23 @@ void* handle_client(void* args) {
          printf("Target Host: %s\n",req.hostname);
          printf("Port: %d\n",req.port);
          printf("Path: %s\n",req.path);
-
+         
+         char cache_file[224];
+         get_cache_filename(url,cache_file);
+         printf("Checking cache: %s\n",cache_file);
+         if(check_cache(cache_file)) {
+            printf("CACHE HIT Serving file from the disk\n");
+            FILE *fp = fopen(cache_file,"rb");
+            char file_buffer[8192];
+            int bytes_read;
+            while((bytes_read = fread(file_buffer,1,sizeof(file_buffer),fp)) > 0) {
+                send(newfd,file_buffer,bytes_read,0);
+            }
+            fclose(fp);
+            close(newfd);
+            return NULL;
+         }
+         printf("CACHE MISS Fetching from the Network\n");
          int serverfd = connect_to_host(req.hostname,req.port);
          if(serverfd == -1) {
             char* err_msg = "HTTP 502 Bad Gateway\r\n\r\nConnection Failed";
@@ -71,14 +88,42 @@ void* handle_client(void* args) {
                 close(serverfd);
                 return NULL;
             }
+            char temp_file[256];
+            snprintf(temp_file,sizeof(temp_file),"%s.%ld.tmp",cache_file,pthread_self());
+
+            FILE *cache_fp = fopen(temp_file,"wb");
+            if(!cache_fp) {
+                perror("Warning: Couldn't open the temp file to write in it");
+            }
             char remote_buffer[8192];
             int n, total_bytes = 0;
             while((n =  recv(serverfd,remote_buffer,sizeof(remote_buffer) - 1,0)) > 0) {
                 remote_buffer[n] = '\0';
-                send(newfd,remote_buffer,n,0);
+                if(send(newfd,remote_buffer,n,0) == -1) {
+                    perror("send to client");
+                    break;
+                }
+                
+                if(cache_fp) {
+                    fwrite(remote_buffer,1,n,cache_fp);
+                }
+
                 total_bytes += n;
             }
             
+            if(cache_fp) {
+                fclose(cache_fp);
+                if(total_bytes > 0) {
+                    if(rename(temp_file,cache_file) == 0) {
+                        printf("Cache Committed %s\n",cache_file);
+                        printf("Cached %d bytes to %s\n",total_bytes,cache_file);
+                    } else {
+                        printf("Cache Commit Failed\n");
+                    }
+                } else {
+                    remove(temp_file);
+                }
+            }
             printf("Total Number of Bytes relayed back to the client: %d\n",total_bytes);
 
             close(serverfd);
