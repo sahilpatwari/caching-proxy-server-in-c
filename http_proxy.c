@@ -7,7 +7,9 @@
 #include<netinet/in.h>
 #include<pthread.h>
 #include<unistd.h>
+#include<sys/stat.h>
 #include<string.h>
+#include<signal.h>
 
 #include"proxy.h"
 #include"cache.h"
@@ -78,9 +80,21 @@ void* handle_client(void* args) {
          } else {
             char new_req[8192];
             snprintf(new_req,sizeof(new_req),
-            "%s %s %s\r\nHost: %s\r\nConnection: close\r\n\r\n"
+            "%s %s %s\r\nHost: %s\r\nConnection: close\r\n"
             ,method,req.path,protocol,req.hostname);
             
+            char *buffer_ptr;
+            char *token = strtok_r(buffer,"\r\n",&buffer_ptr);
+            while(token != NULL) {
+                if(strncmp(token,method,strlen(method)) == 0 || strncmp(token,"Host",4) == 0 || strncmp(token,"Connection",10) == 0) {
+                      token = strtok_r(NULL,"\r\n",&buffer_ptr);
+                      continue;
+                }
+                snprintf(new_req + strlen(new_req),sizeof(new_req),"%s\r\n",token);
+                token = strtok_r(NULL,"\r\n",&buffer_ptr);
+            }
+            snprintf(new_req + strlen(new_req),sizeof(new_req),"\r\n");
+            printf("%s",new_req);
             printf("Forwarding Request\n");
 
             if(send(serverfd,new_req,strlen(new_req),0) == -1) {
@@ -88,6 +102,9 @@ void* handle_client(void* args) {
                 close(serverfd);
                 return NULL;
             }
+            
+            enforce_cache_capacity();
+         
             char temp_file[256];
             snprintf(temp_file,sizeof(temp_file),"%s.%ld.tmp",cache_file,pthread_self());
 
@@ -141,6 +158,9 @@ int main() {
     struct addrinfo hints, *res, *p;
     socklen_t sin_size;
     int status, sockfd,newfd,yes = 1;
+    
+    signal(SIGPIPE, SIG_IGN); 
+    mkdir("cache", 0777);
 
     memset(&hints,0,sizeof hints);
     hints.ai_family = AF_UNSPEC;
