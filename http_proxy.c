@@ -103,7 +103,7 @@ void* handle_client(void* args) {
                 return NULL;
             }
             
-            enforce_cache_capacity();
+            lru_cache();
          
             char temp_file[256];
             snprintf(temp_file,sizeof(temp_file),"%s.%ld.tmp",cache_file,pthread_self());

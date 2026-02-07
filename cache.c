@@ -8,6 +8,13 @@
 #include"cache.h"
 
 #define MAX_CACHE_SIZE 1024
+
+struct {
+    char filename[256];
+    time_t mtime;
+    long size;
+}CacheEntry;
+
 //djb2 hash algorithm
 unsigned long hash_url(char* url) {
     char* str = url;
@@ -46,15 +53,22 @@ int check_cache(char* filename) {
     return 1;
 }
 
+int compare_cache_entries(const void* a,const void* b) {
+    CacheEntry *entryA = (CacheEntry*)a;
+    CacheEntry *entryB = (CacxheEntry*)b;
+    return (entryA.st_mtime - entryB.st_mtime);
+}
+
 void enforce_cache_capacity() {
     DIR *d;
     struct dirent *dir;
     struct stat filestat;
-    char file_path[300];
-
+    char file_path[256];
+    
+    CacheEntry entries[10000];
+    int count = 0;
     long total_size = 0;
-    char oldest_file_path[300] = "";
-    time_t oldest_time = time(NULL);
+
     d = opendir("cache");
     if(!d) {
         fprintf(stderr,"Could not open directory");
@@ -67,20 +81,28 @@ void enforce_cache_capacity() {
         snprintf(file_path,sizeof(file_path),"cache/%s",dir->d_name);
 
         if(stat(file_path,&filestat) == 0) {
+              strcpy(entries[count].filename,filepath);
+              entries[count].mtime = filestat.st_mtime;
+              entries[count].size = filestat.st_size;
+
               total_size += filestat.st_size;
-              if(filestat.st_mtime < oldest_time) {
-                oldest_time = filestat.st_mtime;
-                strcpy(oldest_file_path,file_path);
-              }
+              count++;
+
+              if(count >= 10000) break;
         }
     }
     closedir(d);
-
-    if(total_size > MAX_CACHE_SIZE) {
-        if(strlen(oldest_file_path) > 0) {
-            printf("Cache Full(%ld bytes). LRU-style eviction %s\n",total_size,oldest_file_path);
-            remove(oldest_file_path);
-        }
+    
+    qsort(entries,count,sizeof(CacheEntry),compare_cache_entries);
+    int i = 0;
+    while(total_size > MAX_CACHE_SIZE && i <= count) {
+           printf("Cache Overflow (%ld/%d bytes). Evicting %s",total_size,MAX_CACHE_SIZE,entries[i].filename);
+           if(remove(entries[i].filename) == 0) {
+               total_size -= entries[i].size;
+           } else {
+               perror("Failed to delete cache file");
+           }
+           i++;
     }
 }
 
