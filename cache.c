@@ -50,6 +50,7 @@ int check_cache(char* filename) {
         printf("Cache Expired!Fetching a new copy....\n");
         return 0;
     }
+    mark_as_used(filename);
     return 1;
 }
 

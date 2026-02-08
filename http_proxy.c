@@ -21,6 +21,35 @@ typedef struct {
     int client_fd;
 }thread_args_t;
 
+void send_error_response(int client_fd,int status_code,char *message) {
+    char response[1024];
+    char *status_text;
+
+    switch(status_code) {
+        case 400: status_text = "Bad Request"; break;
+        case 403: status_text = "Forbidden"; break;
+        case 404: status_text = "Not Found"; break;
+        case 500: status_text = "Internal Server Error"; break;
+        case 501: status_text = "Not Implemented"; break;
+        case 502: status_text = "Bad Gateway"; break;
+        case 503: status_text = "Service Unavailable"; break;
+        case 504: status_text = "Gateway Timeout"; break;
+        default:  status_text = "Error"; break;
+    }
+
+    snprintf(response,sizeof(response),
+             "HTTP %d %s\r\n"
+             "Content-Type:text/html\r\n"
+             "Content-Length:%ld\r\n"
+             "Connection:close\r\n"
+             "\r\n"
+             "<html><body><h1>%d %s</h1><p>%s</p></body></html>",
+             status_code,status_text,strlen(message) + 50,status_code,status_text,message);
+    
+    if(send(client_fd,response,strlen(response),0) == -1) {
+       perror("Failed to send error response to client");
+    }
+}
 
 void* handle_client(void* args) {
     thread_args_t *thread_args = (thread_args_t*)args;
@@ -31,6 +60,7 @@ void* handle_client(void* args) {
     int bytes_received = recv(newfd,buffer,BUFFER - 1,0);
     if(bytes_received < 0) {
         perror("recieve");
+        send_error_response(newfd, 400, "Failed to read request.");
         close(newfd);
         return NULL;
     }
@@ -39,16 +69,9 @@ void* handle_client(void* args) {
     char method[16],url[5120],protocol[16];
     int count = sscanf(buffer,"%15s %5119s %15s",method,url,protocol);
     if(count != 3) {
-        fprintf(stderr,"Unknown Error in Parsing the Request");
-        response = "HTTP/1.1 500 Internal Server Error\r\n"
-                "\r\n"
-                "Internal Server Error";
-        
-        if(send(newfd,response,strlen(response),0) == -1) {
-            perror("send");
-            close(newfd);
-            return NULL;
-        }
+       send_error_response(newfd, 400, "Invalid HTTP Request Format.");
+       close(newfd);
+       return NULL;
     }
     struct ProxyRequest req;
     if(parse_url(url,&req) == 0) {
@@ -75,8 +98,9 @@ void* handle_client(void* args) {
          printf("CACHE MISS Fetching from the Network\n");
          int serverfd = connect_to_host(req.hostname,req.port);
          if(serverfd == -1) {
-            char* err_msg = "HTTP 502 Bad Gateway\r\n\r\nConnection Failed";
-            send(newfd,err_msg,strlen(err_msg),0);
+            send_error_response(newfd, 502, "Could not connect to the remote server. Check the hostname or your internet.");
+            close(newfd);
+            return NULL;
          } else {
             char new_req[8192];
             snprintf(new_req,sizeof(new_req),
@@ -98,12 +122,14 @@ void* handle_client(void* args) {
             printf("Forwarding Request\n");
 
             if(send(serverfd,new_req,strlen(new_req),0) == -1) {
-                perror("send to server");
-                close(serverfd);
-                return NULL;
+               perror("send to server");
+               send_error_response(newfd, 503, "Failed to forward request to server.");
+               close(serverfd);
+               close(newfd);
+               return NULL;
             }
             
-            lru_cache();
+            enforce_cache_capacity();
          
             char temp_file[256];
             snprintf(temp_file,sizeof(temp_file),"%s.%ld.tmp",cache_file,pthread_self());
@@ -113,24 +139,32 @@ void* handle_client(void* args) {
                 perror("Warning: Couldn't open the temp file to write in it");
             }
             char remote_buffer[8192];
-            int n, total_bytes = 0;
+            int n, total_bytes = 0,completed = 0,has_sent_headers = 0;
             while((n =  recv(serverfd,remote_buffer,sizeof(remote_buffer) - 1,0)) > 0) {
                 remote_buffer[n] = '\0';
                 if(send(newfd,remote_buffer,n,0) == -1) {
                     perror("send to client");
                     break;
                 }
-                
+                has_sent_headers = 1;
                 if(cache_fp) {
                     fwrite(remote_buffer,1,n,cache_fp);
                 }
 
                 total_bytes += n;
             }
-            
+            if(n == 0) {
+                completed = 1;
+            } else {
+                if(!has_sent_headers) {
+                    send_error_response(newfd, 502, "Remote server dropped connection.");
+                }
+                close(newfd);
+            }
+
             if(cache_fp) {
                 fclose(cache_fp);
-                if(total_bytes > 0) {
+                if(completed && total_bytes > 0) {
                     if(rename(temp_file,cache_file) == 0) {
                         printf("Cache Committed %s\n",cache_file);
                         printf("Cached %d bytes to %s\n",total_bytes,cache_file);
@@ -138,6 +172,7 @@ void* handle_client(void* args) {
                         printf("Cache Commit Failed\n");
                     }
                 } else {
+                    printf("Transfer interuppted! Deleting the temp file\n");
                     remove(temp_file);
                 }
             }
@@ -149,7 +184,9 @@ void* handle_client(void* args) {
 
 
     } else {
-        printf("Invalid URL Format\n");
+        send_error_response(newfd, 400, "Invalid URL Format.");
+        close(newfd);
+        return NULL;
     }
     return NULL;
 }
