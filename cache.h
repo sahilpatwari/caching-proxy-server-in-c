@@ -7,7 +7,7 @@ int check_cache(char*);
 
 void enforce_cache_capacity();
 
-void  serve_from_cache(int,char*,char*,char*);
+void  serve_from_cache(int,char*,char*,char*,unsigned long);
 
-void fetch_and_cache(int,int,char*,char*,char*);
+void fetch_and_cache(int,int,char*,char*,char*,unsigned long);
 #endif

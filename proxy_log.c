@@ -7,18 +7,22 @@
 
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
 static FILE* log_file = NULL;
+static LogLevel current_level = LEVEL_INFO; // Default to INFO
 
-void init_log() {
+void init_log(LogLevel level) {
     pthread_mutex_lock(&log_lock);
     log_file = fopen("proxy.log","a");
     if(!log_file) {
         perror("Warning! Failed to open log file! Logging Disabled");
     }
+    current_level = level;
     pthread_mutex_unlock(&log_lock);
 }
 
-void log_message(const char* client_ip,const char* request_url,int status_code,long size) {
+void log_event(LogLevel level, unsigned long req_id, const char *client_ip, const char *event_msg) {
     if(!log_file) return;
+    
+    if (level < current_level) return;
 
     time_t now = time(NULL);
     struct tm* t = localtime(&now);
@@ -26,11 +30,19 @@ void log_message(const char* client_ip,const char* request_url,int status_code,l
     strftime(time_str,sizeof(time_str),"%Y-%m-%d %H:%M:%S",t);
     
     const char* safe_ip = client_ip ? client_ip : "-";
-    const char* safe_url = request_url ? request_url : "-";
+
+    const char *level_str = "UNK";
+    switch(level) {
+        case LEVEL_DEBUG: level_str = "DBG"; break;
+        case LEVEL_INFO:  level_str = "INF"; break;
+        case LEVEL_WARN:  level_str = "WRN"; break;
+        case LEVEL_ERROR: level_str = "ERR"; break;
+    }
+
     pthread_mutex_lock(&log_lock);
-
-    fprintf(log_file,"[%s] [%s] %s %d %ld bytes\n",time_str,safe_ip,safe_url,status_code,size);
-
+    
+    // Format: [Time] [ReqID] [IP] [Level] Message
+    fprintf(log_file, "[%s] [Req:%lu] [%s] [%s] %s\n", time_str, req_id, safe_ip, level_str, event_msg);
     fflush(log_file);
 
     pthread_mutex_unlock(&log_lock);

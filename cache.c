@@ -119,14 +119,15 @@ void enforce_cache_capacity() {
     free(entries);
 }
 
-void serve_from_cache(int client_fd,char* url,char* client_ip,char* cache_file) {
+void serve_from_cache(int client_fd,char* url,char* client_ip,char* cache_file,unsigned long req_id) {
     FILE *fp = fopen(cache_file,"rb");
 
     if (!fp) {
-        perror("Error opening cache file");
         send_error_response(client_fd, 500, "Internal Cache Error");
-        log_message(client_ip, url, 500, 0);
+        log_event(LEVEL_ERROR, req_id, client_ip, "Cache Hit but failed to open file");
     }
+    
+    log_event(LEVEL_DEBUG, req_id, client_ip, "Streaming from cache...");
 
     char file_buffer[BUFFER];
     int bytes_read;
@@ -134,22 +135,23 @@ void serve_from_cache(int client_fd,char* url,char* client_ip,char* cache_file) 
     int success = 1;
     while((bytes_read = fread(file_buffer,1,sizeof(file_buffer),fp)) > 0) {
     if(send(client_fd, file_buffer, bytes_read, MSG_NOSIGNAL) == -1) {
-            perror("Client disconnected during cache transfer");
+            log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during cache stream");
             success = 0;
             break;
         }
         total_sent += bytes_read;
     }
     fclose(fp);
-
+    char log_msg[128];
     if (success) {
-        log_message(client_ip, url, 200, total_sent);      
+       snprintf(log_msg, sizeof(log_msg), "Cache HIT served: %ld bytes", total_sent);
+       log_event(LEVEL_INFO, req_id, client_ip, log_msg); 
     } else {
-        log_message(client_ip, url, 499, total_sent); // 499 Client Closed Request
+       log_event(LEVEL_WARN, req_id, client_ip, "Client Closed Request");
     }
 }
 
-void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* cache_file) {
+void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* cache_file,unsigned long req_id) {
 
     enforce_cache_capacity();
 
@@ -158,21 +160,24 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
 
     FILE *cache_fp = fopen(temp_file,"wb");
     if(!cache_fp) {
-        perror("Warning: Failed to create temp cache file");
+        log_event(LEVEL_WARN, req_id, client_ip, "Failed to create temp cache file (Disk full?)");
     }
+    log_event(LEVEL_DEBUG, req_id, client_ip, "Downloading from upstream...");
+
     char remote_buffer[8192];
     int n,completed = 0,has_sent_headers = 0;
     long total_bytes = 0;
     while((n =  recv(serverfd,remote_buffer,sizeof(remote_buffer) - 1,0)) > 0) {
         remote_buffer[n] = '\0';
         if(send(client_fd, remote_buffer, n, MSG_NOSIGNAL) == -1) {
+            log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during download");
             break;
         }
         has_sent_headers = 1;
         
         if(cache_fp) {
             if(fwrite(remote_buffer, 1, n, cache_fp) != n) {
-                perror("Cache write error");
+                log_event(LEVEL_ERROR, req_id, client_ip, "Cache write error");
                 fclose(cache_fp);
                 cache_fp = NULL;
                 remove(temp_file);
@@ -183,7 +188,7 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
     if (n == 0) {
         completed = 1;
     } else if (n < 0) {
-        perror("Upstream recv error");
+        log_event(LEVEL_ERROR, req_id, client_ip, "Upstream recv error");
         if (!has_sent_headers) {
             send_error_response(client_fd, 502, "Bad Gateway: Upstream Error");
         }
@@ -193,9 +198,9 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
         fclose(cache_fp);
         if(completed && total_bytes > 0) {
             if(rename(temp_file, cache_file) == 0) {
-                printf("[Cache] Committed: %s (%ld bytes)\n", cache_file, total_bytes);
+                log_event(LEVEL_DEBUG, req_id, client_ip, "Cache commit successful");
             } else {
-                perror("Cache commit rename failed");
+               log_event(LEVEL_ERROR, req_id, client_ip, "Cache commit failed (rename)");
                 remove(temp_file);
             }
         } else {
@@ -203,10 +208,13 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
         }
     }
     
+    char log_msg[128];
     if (completed) {
-        log_message(client_ip, url, 200, total_bytes);
+        snprintf(log_msg, sizeof(log_msg), "Cache MISS served: %ld bytes", total_bytes);
+        log_event(LEVEL_INFO, req_id, client_ip, log_msg);
     } else {
-        log_message(client_ip, url, 502, total_bytes);
+        snprintf(log_msg, sizeof(log_msg), "Transaction Failed. Relayed: %ld bytes", total_bytes);
+        log_event(LEVEL_WARN, req_id, client_ip, log_msg);
     }
 }
 

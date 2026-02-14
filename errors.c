@@ -11,6 +11,7 @@ void send_error_response(int client_fd,int status_code,char *message) {
         case 400: status_text = "Bad Request"; break;
         case 403: status_text = "Forbidden"; break;
         case 404: status_text = "Not Found"; break;
+        case 411: status_text = "Length Required"; break;
         case 500: status_text = "Internal Server Error"; break;
         case 501: status_text = "Not Implemented"; break;
         case 502: status_text = "Bad Gateway"; break;
