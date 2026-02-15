@@ -11,7 +11,7 @@ typedef enum {
 
 void init_log(LogLevel);
 
-void log_event(LogLevel, unsigned long, const char*, const char*);
+void log_event(LogLevel, uint64_t, const char*, const char*);
 
 void close_log();
 #endif

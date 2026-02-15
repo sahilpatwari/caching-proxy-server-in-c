@@ -11,6 +11,9 @@
 #include<string.h>
 #include<signal.h>
 #include <stdatomic.h>
+#include <time.h>
+#include <stdint.h> 
+#include <inttypes.h>
 
 #include"proxy.h"
 #include"cache.h"
@@ -22,13 +25,13 @@
 #define BUFFER 8192
 
 // ATOMIC REQUEST ID COUNTER
-static _Atomic unsigned long global_req_id = 1;
+static _Atomic uint64_t global_req_id = 0;
 
 typedef struct {
     int client_fd;
 }thread_args_t;
 
-void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_buffer,int initial_len,char* method,char* url,char* protocol,char* client_ip,unsigned long req_id) {
+void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_buffer,int initial_len,char* method,char* url,char* protocol,char* client_ip,uint64_t req_id) {
     
     char log_buf[1536];
     snprintf(log_buf, sizeof(log_buf), "Tunnel Start: %s:%d", req->hostname, req->port);
@@ -49,7 +52,8 @@ void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_
     int serverfd = connect_to_host(req->hostname,req->port);
     if(serverfd == -1) {
         send_error_response(client_fd, 502, "Bad Gateway: Could not connect to remote server");
-        log_event(LEVEL_ERROR, req_id, client_ip, "Upstream connection failed");
+        snprintf(log_buf, sizeof(log_buf), "Upstream connection failed: %s", req->hostname);
+        log_event(LEVEL_ERROR, req_id, client_ip, log_buf);
         return;
     }
     log_event(LEVEL_DEBUG, req_id, client_ip, "Upstream connected");
@@ -119,7 +123,7 @@ void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_
     char buffer[BUFFER];
     while(content_length > 0) {
         int bytes,len;
-        if(bytes = recv(client_fd,buffer,sizeof(BUFFER),MSG_NOSIGNAL) == -1) {
+        if((bytes = recv(client_fd,buffer,BUFFER - 1,MSG_NOSIGNAL)) == -1) {
             log_event(LEVEL_WARN,req_id,client_ip,"Client disconnected during body upload");
             close(serverfd);
             return;
@@ -128,7 +132,7 @@ void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_
         len = bytes;
         while(bytes > 0) {
             int n;
-            if((n = send(serverfd,buffer,sizeof(buffer),MSG_NOSIGNAL)) == -1) {
+            if((n = send(serverfd,buffer,bytes,MSG_NOSIGNAL)) == -1) {
                 perror("Failed to send body");
                 log_event(LEVEL_WARN, req_id, client_ip, "Upstream closed during initial body send");
                 close(serverfd);
@@ -138,20 +142,20 @@ void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_
         }
         content_length -= len;
     }
-    long total_bytes,recv_bytes;
+    long total_bytes = 0,recv_bytes;
     char recv_buffer[BUFFER];
-    while((recv_bytes = recv(serverfd,recv_buffer,sizeof(recv_buffer),0)) > 0) {
+    while((recv_bytes = recv(serverfd,recv_buffer,BUFFER - 1,0)) > 0) {
         while(recv_bytes > 0) {
             int n;
-            if((n = send(client_fd,recv_buffer,sizeof(recv_buffer),0)) == -1) {
+            if((n = send(client_fd,recv_buffer,recv_bytes,0)) == -1) {
                 perror("Failed to send to client");
                 log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during responding");
                 close(serverfd);
                 return;
             }
             recv_bytes -= n;
+            total_bytes += n;
         }
-        total_bytes += recv_bytes;
     }
     if(recv_bytes == -1) {
         perror("Failed to receive data from upstream");
@@ -161,7 +165,7 @@ void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_
     }
     snprintf(log_buf, sizeof(log_buf), "Tunnel Closed. Relayed: %ld bytes", total_bytes);
     log_event(LEVEL_INFO, req_id, client_ip, log_buf);
-    printf("Total Bytes relayed: %ld bytes",total_bytes);
+    printf("Total Bytes relayed: %ld bytes\n",total_bytes);
     close(serverfd);
 }
 
@@ -171,7 +175,7 @@ void* handle_client(void* args) {
     free(thread_args);
     
     // GENERATE ID
-    unsigned long req_id = global_req_id++;
+    uint64_t req_id = global_req_id++;
 
     struct sockaddr_storage addr;
     socklen_t addr_size = sizeof(addr);
@@ -216,6 +220,10 @@ void* handle_client(void* args) {
         return NULL;
     }
     printf("[Proxy] Request: %s %s\n", method, url);
+    char log_buf[1536];
+    snprintf(log_buf, sizeof(log_buf), "Request: %s %s:%d", method, req.hostname, req.port);
+    log_event(LEVEL_INFO, req_id, client_ip, log_buf);
+
 
     if(strncmp(method,"GET",3) == 0) {
         char cache_file[256];
@@ -234,7 +242,8 @@ void* handle_client(void* args) {
         int serverfd = connect_to_host(req.hostname,req.port);
         if(serverfd == -1) {
             send_error_response(newfd, 502, "Bad Gateway: Could not connect to remote server");
-            log_event(LEVEL_ERROR, req_id, client_ip, "GET Upstream connection failed");
+            snprintf(log_buf, sizeof(log_buf), "Upstream connection failed: %s", req.hostname);
+            log_event(LEVEL_ERROR, req_id, client_ip, log_buf);
             close(newfd);
             return NULL;
         }
@@ -260,7 +269,8 @@ void* handle_client(void* args) {
         if(send(serverfd,new_req,strlen(new_req),0) == -1) {
             perror("Upstream send failed");
             send_error_response(newfd, 503, "Service Unavailable");
-            log_event(LEVEL_ERROR, req_id, client_ip, "GET Headers send failed");
+            snprintf(log_buf, sizeof(log_buf), "Failed to send headers to: %s", req.hostname);
+            log_event(LEVEL_ERROR, req_id, client_ip, log_buf);
             close(serverfd);
             close(newfd);
             return NULL;
@@ -325,6 +335,8 @@ int main() {
         exit(1);
     }
     printf("Server is listening\n");
+    global_req_id = (uint64_t)time(NULL) << 16;
+    printf("Proxy Server started. Initial Req ID: %" PRIu64 "\n", global_req_id);
     while(1) {
         sin_size = sizeof their_addr;
         newfd = accept(sockfd,(struct sockaddr*)&their_addr,&sin_size);

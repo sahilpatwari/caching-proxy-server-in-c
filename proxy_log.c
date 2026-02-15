@@ -3,6 +3,8 @@
 #include<time.h>
 #include<pthread.h>
 #include<string.h>
+#include<stdint.h>
+#include <inttypes.h>
 #include"proxy_log.h"
 
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -19,7 +21,7 @@ void init_log(LogLevel level) {
     pthread_mutex_unlock(&log_lock);
 }
 
-void log_event(LogLevel level, unsigned long req_id, const char *client_ip, const char *event_msg) {
+void log_event(LogLevel level, uint64_t req_id, const char *client_ip,const char *event_msg) {
     if(!log_file) return;
     
     if (level < current_level) return;
@@ -42,7 +44,7 @@ void log_event(LogLevel level, unsigned long req_id, const char *client_ip, cons
     pthread_mutex_lock(&log_lock);
     
     // Format: [Time] [ReqID] [IP] [Level] Message
-    fprintf(log_file, "[%s] [Req:%lu] [%s] [%s] %s\n", time_str, req_id, safe_ip, level_str, event_msg);
+    fprintf(log_file, "[%s] [Req:%" PRIu64 "] [%s] [%s] %s\n", time_str, req_id, safe_ip, level_str, event_msg);
     fflush(log_file);
 
     pthread_mutex_unlock(&log_lock);

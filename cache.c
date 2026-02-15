@@ -7,6 +7,7 @@
 #include<dirent.h>
 #include<sys/socket.h>
 #include<pthread.h>
+#include<stdint.h>
 #include"cache.h"
 #include"proxy_log.h"
 #include"errors.h"
@@ -107,7 +108,7 @@ void enforce_cache_capacity() {
     
     qsort(entries,count,sizeof(CacheEntry),compare_cache_entries);
     int i = 0;
-    while(total_size > MAX_CACHE_SIZE && i <= count) {
+    while(total_size > MAX_CACHE_SIZE && i < count) {
            printf("Cache Overflow (%ld/%d bytes). Evicting %s\n",total_size,MAX_CACHE_SIZE,entries[i].filename);
            if(remove(entries[i].filename) == 0) {
                total_size -= entries[i].size;
@@ -119,7 +120,7 @@ void enforce_cache_capacity() {
     free(entries);
 }
 
-void serve_from_cache(int client_fd,char* url,char* client_ip,char* cache_file,unsigned long req_id) {
+void serve_from_cache(int client_fd,char* url,char* client_ip,char* cache_file,uint64_t req_id) {
     FILE *fp = fopen(cache_file,"rb");
 
     if (!fp) {
@@ -151,7 +152,7 @@ void serve_from_cache(int client_fd,char* url,char* client_ip,char* cache_file,u
     }
 }
 
-void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* cache_file,unsigned long req_id) {
+void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* cache_file,uint64_t req_id) {
 
     enforce_cache_capacity();
 
@@ -164,10 +165,10 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
     }
     log_event(LEVEL_DEBUG, req_id, client_ip, "Downloading from upstream...");
 
-    char remote_buffer[8192];
+    char remote_buffer[BUFFER];
     int n,completed = 0,has_sent_headers = 0;
     long total_bytes = 0;
-    while((n =  recv(serverfd,remote_buffer,sizeof(remote_buffer) - 1,0)) > 0) {
+    while((n =  recv(serverfd,remote_buffer,BUFFER - 1,0)) > 0) {
         remote_buffer[n] = '\0';
         if(send(client_fd, remote_buffer, n, MSG_NOSIGNAL) == -1) {
             log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during download");
