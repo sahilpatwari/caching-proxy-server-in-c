@@ -3,11 +3,14 @@
 #include<string.h>
 #include<time.h>
 #include<pthread.h>
+#include<unistd.h>
 #include<netinet/in.h>
 #include"rate_limiter.h"
 
 #define RATE_LIMITER_CAPACITY 10
-#define refill_rate 1
+#define REFILL_RATE 1
+#define CLIENT_TIMEOUT 60      // Remove client if inactive for 60s
+#define CLEANUP_INTERVAL 30    // Run cleanup every 30s
 
 typedef struct ClientNode{
     char ip[INET6_ADDRSTRLEN];
@@ -18,9 +21,52 @@ typedef struct ClientNode{
 
 static pthread_mutex_t limit_lock = PTHREAD_MUTEX_INITIALIZER;
 static ClientNode* head = NULL;
+pthread_t cleaner_thread;
+static int running =1;
 
+void* prune_stale_clients(void* args) {
+    while(running) {
+       sleep(CLEANUP_INTERVAL);
+
+        time_t now = time(NULL);
+        pthread_mutex_lock(&limit_lock);
+
+        ClientNode* current = head;
+        ClientNode* prev = NULL;
+        int pruned_count = 0;
+
+        while(current != NULL) {
+            if(difftime(now,current->last_refill) > CLIENT_TIMEOUT) {
+                ClientNode* to_free = current;
+
+                if(prev == NULL) {
+                    head = current->next;
+                    current = head;
+                } else {
+                    prev->next = current->next;
+                    current = current->next;
+                }
+
+                free(to_free);
+                pruned_count++;
+            } else {
+                prev = current;
+                current = current->next;
+            }
+        }
+
+        pthread_mutex_unlock(&limit_lock);
+
+        if(pruned_count > 0) {
+            printf("[RateLimit] Pruned %d stale clients.\n", pruned_count);
+        }
+    }
+    return NULL;
+}
 void init_rate_limiter() {
-    //Maybe required later for setup
+    if (pthread_create(&cleaner_thread, NULL, prune_stale_clients, NULL) != 0) {
+        perror("Failed to start rate limiter cleanup thread");
+    }
 }
 
 int check_rate_limit(char* client_ip) {
@@ -52,7 +98,7 @@ int check_rate_limit(char* client_ip) {
     time_t now = time(NULL);
     int seconds_passed = difftime(now,target->last_refill);
     if(seconds_passed > 0) {
-        target->tokens += seconds_passed * refill_rate;
+        target->tokens += seconds_passed * REFILL_RATE;
         if(target->tokens > RATE_LIMITER_CAPACITY) {
             target->tokens = RATE_LIMITER_CAPACITY;
         }
@@ -71,6 +117,9 @@ int check_rate_limit(char* client_ip) {
 }
 
 void destroy_rate_limiter() {
+    running = 0;
+    pthread_cancel(cleaner_thread);
+    pthread_join(cleaner_thread,NULL);
     pthread_mutex_lock(&limit_lock);
     while(head != NULL) {
         ClientNode* del = head;
