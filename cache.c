@@ -12,7 +12,7 @@
 #include"proxy_log.h"
 #include"errors.h"
 
-#define MAX_CACHE_SIZE 1024 
+#define MAX_CACHE_SIZE 10*1024*1024 
 #define BUFFER 8192
 
 typedef struct {
@@ -52,7 +52,7 @@ int check_cache(char* filename) {
 
     printf("File Age: %.0f seconds passed\n",seconds_passed);
 
-    if(seconds_passed > 60) {
+    if(seconds_passed > 60 || seconds_passed < 0) {
         printf("Cache Expired!Fetching a new copy....\n");
         return 0;
     }

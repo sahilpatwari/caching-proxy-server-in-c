@@ -19,6 +19,7 @@
 #include"cache.h"
 #include"proxy_log.h"
 #include"errors.h"
+#include"rate_limiter.h"
 
 #define PORT "3490"
 #define BACKLOG 10
@@ -77,7 +78,7 @@ void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_
         return;
     }
     snprintf(header_buffer,sizeof(header_buffer),
-    "%s %s %s\r\nHost:%s\r\nConnection:close\r\n",method,req->path,protocol,req->hostname);
+    "%s %s %s\r\nHost: %s\r\nConnection: close\r\n",method,req->path,protocol,req->hostname);
 
     memcpy(headers_copy,initial_buffer,header_end_idx);
     headers_copy[header_end_idx] = '\0';
@@ -187,7 +188,15 @@ void* handle_client(void* args) {
     } else {
         strcpy(client_ip,"UNKNOWN");
     }
-
+    
+    //RATE LIMIT
+    if(!check_rate_limit(client_ip)) {
+        printf("[Rate Limit] Denied: %s\n", client_ip);
+        log_event(LEVEL_WARN, req_id, client_ip, "Rate Limit Exceeded (429)");
+        send_error_response(newfd, 429, "Too Many Requests. Slow down.");
+        close(newfd);
+        return NULL;
+    }
     char buffer[BUFFER];
     printf("Client Connected\n");
     int bytes_received = recv(newfd,buffer,BUFFER - 1,0);
@@ -297,6 +306,7 @@ int main() {
     signal(SIGPIPE, SIG_IGN); 
     mkdir("cache", 0777);
     init_log(LEVEL_DEBUG);
+    init_rate_limiter();
     memset(&hints,0,sizeof hints);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
