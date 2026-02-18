@@ -218,6 +218,7 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
         remote_buffer[n] = '\0';
         int ttl;
         int send_bytes = 0;
+        int client_connected = 1;
         while(send_bytes < n) {
             if(first_chunk) {
                 ttl = parse_cache_policy(remote_buffer);
@@ -235,12 +236,14 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
             }
             int byt = 0;
             while(send_bytes < n) {
-                if((byt = send(client_fd, remote_buffer, n, MSG_NOSIGNAL)) == -1) {
+                if((byt = send(client_fd, remote_buffer + send_bytes, n - send_bytes, MSG_NOSIGNAL)) == -1) {
+                    cliemnt_connected = 0;
                     log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during download");
                     break;
                 }
                 send_bytes += byt;
             }
+            if(!client_connected) break;
             has_sent_headers = 1;
             
             if(cache_fp && is_cacheable) {
@@ -253,6 +256,7 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
             }
             total_bytes += n;
         }
+        if(!client_connected) break;
     }
     if (n == 0) {
         completed = 1;

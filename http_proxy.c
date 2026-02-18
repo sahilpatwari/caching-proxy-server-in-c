@@ -110,51 +110,51 @@ void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_
 
     //Send remaining body in buffer
     int body_in_buffer = initial_len - (body_start - initial_buffer);
-    while(body_in_buffer > 0) {
+    int body_len = 0;
+    while(body_len < body_in_buffer) {
         int n;
-        if((n =send(serverfd,body_start,body_in_buffer,MSG_NOSIGNAL)) == -1) {
+        if((n =send(serverfd,body_start + body_len,body_in_buffer - body_len,MSG_NOSIGNAL)) == -1) {
             perror("Failed to send remaining body");
             log_event(LEVEL_WARN, req_id, client_ip, "Upstream closed during initial body send");
             close(serverfd);
             return;
         }
         content_length -= n;
-        body_in_buffer -= n;
+        body_len += n;
     }
     char buffer[BUFFER];
     while(content_length > 0) {
-        int bytes,len;
+        int bytes,len = 0;
         if((bytes = recv(client_fd,buffer,BUFFER - 1,MSG_NOSIGNAL)) == -1) {
             log_event(LEVEL_WARN,req_id,client_ip,"Client disconnected during body upload");
             close(serverfd);
             return;
         }
         buffer[bytes] ='\0';
-        len = bytes;
-        while(bytes > 0) {
-            int n;
-            if((n = send(serverfd,buffer,bytes,MSG_NOSIGNAL)) == -1) {
+        while(len < bytes) {
+            int n = 0;
+            if((n = send(serverfd,buffer + len,bytes - len,MSG_NOSIGNAL)) == -1) {
                 perror("Failed to send body");
                 log_event(LEVEL_WARN, req_id, client_ip, "Upstream closed during initial body send");
                 close(serverfd);
                 return;
             }
-            bytes -= n;
+            len += n;
         }
         content_length -= len;
     }
-    long total_bytes = 0,recv_bytes;
+    long total_bytes = 0,recv_bytes,recv_len = 0;
     char recv_buffer[BUFFER];
     while((recv_bytes = recv(serverfd,recv_buffer,BUFFER - 1,0)) > 0) {
-        while(recv_bytes > 0) {
+        while(recv_len < recv_bytes) {
             int n;
-            if((n = send(client_fd,recv_buffer,recv_bytes,0)) == -1) {
+            if((n = send(client_fd,recv_buffer + recv_len,recv_bytes - recv_len,0)) == -1) {
                 perror("Failed to send to client");
                 log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during responding");
                 close(serverfd);
                 return;
             }
-            recv_bytes -= n;
+            recv_len += n;
             total_bytes += n;
         }
     }
