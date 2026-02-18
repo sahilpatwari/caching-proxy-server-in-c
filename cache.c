@@ -21,6 +21,13 @@ typedef struct {
     long size;
 }CacheEntry;
 
+typedef struct {
+    time_t expires_at;
+    long content_length;
+    char url[5120];
+    char padding[256];
+}CacheHeader;
+
 //djb2 hash algorithm
 unsigned long hash_url(char* url) {
     char* str = url;
@@ -41,21 +48,51 @@ void mark_as_used(char* filename) {
     utime(filename,NULL);
 }
 
-int check_cache(char* filename) {
-    struct stat buffer;
+int parse_cache_policy(char* response_buffer) {
+    int ttl = 300;// Default TTL
+    char* cc_header = strstr(response_buffer,"Cache-Control:");
+    if(!cc_header) return ttl;
+    cc_header += 15;
+    if(strncmp(cc_header,"no-store",8) == 0 || strncmp(cc_header,"no-cache",8) == 0 || strncmp(cc_header,"private",7) == 0) {
+        return - 1; // Don't cache
+    }
 
-    if(stat(filename,&buffer) != 0) {
+    if(strncmp(cc_header,"max-age=",8) == 0) {
+        ttl = atoi(cc_header + 8);
+    }
+    return ttl;
+}
+
+int check_cache(char* filename,char* url) {
+    FILE* fp = fopen(filename,"rb");
+    if(!fp) return 0;
+    
+    CacheHeader header;
+    if(fread(&header,sizeof(CacheHeader),1,fp) != 1) {
+        fclose(fp); // Invalid File
         return 0;
     }
     time_t now = time(NULL);
-    double seconds_passed = difftime(now,buffer.st_mtime);
-
-    printf("File Age: %.0f seconds passed\n",seconds_passed);
-
-    if(seconds_passed > 60 || seconds_passed < 0) {
+    if(now > header.expires_at) {
         printf("Cache Expired!Fetching a new copy....\n");
         return 0;
     }
+
+    if(strcmp(url,header.url) != 0) {
+        printf("URL Expected: %s GOT: %s\n",url,header.url);
+        fclose(fp);
+        return 0;
+    }
+
+    fseek(fp,0,SEEK_END);
+    long actual_size = ftell(fp);
+    long expected_size = sizeof(CacheHeader) + header.content_length;
+
+    if(actual_size < expected_size) {
+        fclose(fp);
+        return 0;
+    }
+    fclose(fp);
     mark_as_used(filename);
     return 1;
 }
@@ -126,10 +163,15 @@ void serve_from_cache(int client_fd,char* url,char* client_ip,char* cache_file,u
     if (!fp) {
         send_error_response(client_fd, 500, "Internal Cache Error");
         log_event(LEVEL_ERROR, req_id, client_ip, "Cache Hit but failed to open file");
+        return;
     }
     
     log_event(LEVEL_DEBUG, req_id, client_ip, "Streaming from cache...");
-
+    if(fseek(fp,sizeof(CacheHeader),SEEK_SET) != 0) {
+        log_event(LEVEL_ERROR, req_id, client_ip, "Seek failed on cache file");
+        fclose(fp);
+        return;
+    }
     char file_buffer[BUFFER];
     int bytes_read;
     long total_sent = 0;
@@ -166,25 +208,51 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
     log_event(LEVEL_DEBUG, req_id, client_ip, "Downloading from upstream...");
 
     char remote_buffer[BUFFER];
-    int n,completed = 0,has_sent_headers = 0;
+    int n,completed = 0,has_sent_headers = 0,is_cacheable = 1,first_chunk = 1;
     long total_bytes = 0;
+    CacheHeader header;
+    memset(&header,0,sizeof(CacheHeader));
+    strncpy(header.url,url,sizeof(header.url) - 1);
+    header.url[sizeof(header.url) - 1] = '\0';
     while((n =  recv(serverfd,remote_buffer,BUFFER - 1,0)) > 0) {
         remote_buffer[n] = '\0';
-        if(send(client_fd, remote_buffer, n, MSG_NOSIGNAL) == -1) {
-            log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during download");
-            break;
-        }
-        has_sent_headers = 1;
-        
-        if(cache_fp) {
-            if(fwrite(remote_buffer, 1, n, cache_fp) != n) {
-                log_event(LEVEL_ERROR, req_id, client_ip, "Cache write error");
-                fclose(cache_fp);
-                cache_fp = NULL;
-                remove(temp_file);
+        int ttl;
+        int send_bytes = 0;
+        while(send_bytes < n) {
+            if(first_chunk) {
+                ttl = parse_cache_policy(remote_buffer);
+                if(ttl < 0) {
+                   is_cacheable = 0;
+                   log_event(LEVEL_INFO, req_id, client_ip, "Policy: DO NOT CACHE");
+                } else {
+                   is_cacheable = 1;
+                   header.expires_at = time(NULL) + ttl;
+                   if(fwrite(&header,sizeof(CacheHeader),1,cache_fp) != 1) {
+                      is_cacheable = 0;
+                   }
+                }
+                first_chunk = 0;
             }
+            int byt = 0;
+            while(send_bytes < n) {
+                if((byt = send(client_fd, remote_buffer, n, MSG_NOSIGNAL)) == -1) {
+                    log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during download");
+                    break;
+                }
+                send_bytes += byt;
+            }
+            has_sent_headers = 1;
+            
+            if(cache_fp && is_cacheable) {
+                if(fwrite(remote_buffer, 1, n, cache_fp) != n) {
+                    log_event(LEVEL_ERROR, req_id, client_ip, "Cache write error");
+                    fclose(cache_fp);
+                    cache_fp = NULL;
+                    remove(temp_file);
+                }
+            }
+            total_bytes += n;
         }
-        total_bytes += n;
     }
     if (n == 0) {
         completed = 1;
@@ -196,15 +264,21 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
     }
 
     if(cache_fp) {
-        fclose(cache_fp);
-        if(completed && total_bytes > 0) {
-            if(rename(temp_file, cache_file) == 0) {
+        if(is_cacheable && completed && total_bytes > 0) {
+            header.content_length = total_bytes;
+            fseek(cache_fp,0,SEEK_SET);
+            if(fwrite(&header,sizeof(CacheHeader),1,cache_fp) != 1) {
+                is_cacheable = 0;
+            }
+            fclose(cache_fp);
+            if(is_cacheable && rename(temp_file, cache_file) == 0) {
                 log_event(LEVEL_DEBUG, req_id, client_ip, "Cache commit successful");
             } else {
                log_event(LEVEL_ERROR, req_id, client_ip, "Cache commit failed (rename)");
                 remove(temp_file);
             }
         } else {
+            fclose(cache_fp);
             remove(temp_file);
         }
     }

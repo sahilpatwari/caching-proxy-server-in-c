@@ -239,7 +239,7 @@ void* handle_client(void* args) {
         get_cache_filename(url,cache_file);
         printf("Checking cache: %s\n",cache_file);
 
-        if(check_cache(cache_file)) {
+        if(check_cache(cache_file,url)) {
             printf("[Cache] HIT: %s\n", url);
             serve_from_cache(newfd,url,client_ip,cache_file,req_id);
             close(newfd);
