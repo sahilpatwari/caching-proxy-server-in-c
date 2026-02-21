@@ -219,44 +219,41 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
         int ttl;
         int send_bytes = 0;
         int client_connected = 1;
+        if(first_chunk) {
+            ttl = parse_cache_policy(remote_buffer);
+            if(ttl < 0) {
+                is_cacheable = 0;
+                log_event(LEVEL_INFO, req_id, client_ip, "Policy: DO NOT CACHE");
+            } else {
+                is_cacheable = 1;
+                header.expires_at = time(NULL) + ttl;
+                if(fwrite(&header,sizeof(CacheHeader),1,cache_fp) != 1) {
+                    is_cacheable = 0;
+                }
+            }
+            first_chunk = 0;
+        }
+        int byt = 0;
         while(send_bytes < n) {
-            if(first_chunk) {
-                ttl = parse_cache_policy(remote_buffer);
-                if(ttl < 0) {
-                   is_cacheable = 0;
-                   log_event(LEVEL_INFO, req_id, client_ip, "Policy: DO NOT CACHE");
-                } else {
-                   is_cacheable = 1;
-                   header.expires_at = time(NULL) + ttl;
-                   if(fwrite(&header,sizeof(CacheHeader),1,cache_fp) != 1) {
-                      is_cacheable = 0;
-                   }
-                }
-                first_chunk = 0;
+            if((byt = send(client_fd, remote_buffer + send_bytes, n - send_bytes, MSG_NOSIGNAL)) == -1) {
+                client_connected = 0;
+                log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during download");
+                break;
             }
-            int byt = 0;
-            while(send_bytes < n) {
-                if((byt = send(client_fd, remote_buffer + send_bytes, n - send_bytes, MSG_NOSIGNAL)) == -1) {
-                    cliemnt_connected = 0;
-                    log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during download");
-                    break;
-                }
-                send_bytes += byt;
-            }
-            if(!client_connected) break;
-            has_sent_headers = 1;
-            
-            if(cache_fp && is_cacheable) {
-                if(fwrite(remote_buffer, 1, n, cache_fp) != n) {
-                    log_event(LEVEL_ERROR, req_id, client_ip, "Cache write error");
-                    fclose(cache_fp);
-                    cache_fp = NULL;
-                    remove(temp_file);
-                }
-            }
-            total_bytes += n;
+            send_bytes += byt;
         }
         if(!client_connected) break;
+        has_sent_headers = 1;
+        
+        if(cache_fp && is_cacheable) {
+            if(fwrite(remote_buffer, 1, n, cache_fp) != n) {
+                log_event(LEVEL_ERROR, req_id, client_ip, "Cache write error");
+                fclose(cache_fp);
+                cache_fp = NULL;
+                remove(temp_file);
+            }
+        }
+        total_bytes += n;
     }
     if (n == 0) {
         completed = 1;
