@@ -20,6 +20,7 @@
 #include"proxy_log.h"
 #include"errors.h"
 #include"rate_limiter.h"
+#include"thread_pool.h"
 
 #define PORT "3490"
 #define BACKLOG 10
@@ -347,6 +348,7 @@ int main() {
     printf("Server is listening\n");
     global_req_id = (uint64_t)time(NULL) << 16;
     printf("Proxy Server started. Initial Req ID: %" PRIu64 "\n", global_req_id);
+    init_thread_pool(100);
     while(1) {
         sin_size = sizeof their_addr;
         newfd = accept(sockfd,(struct sockaddr*)&their_addr,&sin_size);
@@ -362,14 +364,7 @@ int main() {
         }
 
         args->client_fd = newfd;
-        pthread_t pid;
-        if(pthread_create(&pid,NULL,handle_client,(void*)args) != 0) {
-            free(args);
-            close(newfd);
-        } else {
-            pthread_detach(pid);
-        }
-
+        submit_task(handle_client,(void*) args);
     }
     return 0;
 }

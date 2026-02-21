@@ -216,9 +216,9 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
     header.url[sizeof(header.url) - 1] = '\0';
     while((n =  recv(serverfd,remote_buffer,BUFFER - 1,0)) > 0) {
         remote_buffer[n] = '\0';
+        int client_connected = 1;
         int ttl;
         int send_bytes = 0;
-        int client_connected = 1;
         if(first_chunk) {
             ttl = parse_cache_policy(remote_buffer);
             if(ttl < 0) {
@@ -242,7 +242,10 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
             }
             send_bytes += byt;
         }
-        if(!client_connected) break;
+        if(!client_connected) {
+            is_cacheable = 0;
+            break;
+        }
         has_sent_headers = 1;
         
         if(cache_fp && is_cacheable) {
