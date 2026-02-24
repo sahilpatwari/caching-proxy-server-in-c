@@ -2,9 +2,9 @@
 #define THREAD_POOL_H
 
 
-void init_thread_pool(int);
+void init_thread_pool(int,int);
 
-void submit_task(void* (*function)(void*),void*);
+int submit_task(void* (*function)(void*),void*);
 
 void destroy_thread_pool();
 #endif

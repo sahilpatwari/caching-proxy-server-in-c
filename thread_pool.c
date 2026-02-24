@@ -18,6 +18,8 @@ static struct {
     pthread_t* threads;
     int thread_count;
     int shutdown;
+    int queue_size;
+    int max_queue_size;
 }pool;
 
 static void* worker_thread(void* args) {
@@ -38,7 +40,7 @@ static void* worker_thread(void* args) {
         if(pool.head == NULL) {
             pool.tail = NULL;
         }
-        
+        pool.queue_size--;
         pthread_mutex_unlock(&pool.lock);
 
         if(task != NULL) {
@@ -49,11 +51,13 @@ static void* worker_thread(void* args) {
     return NULL;
 }
 
-void init_thread_pool(int numThreads) {
+void init_thread_pool(int numThreads,int maxQueue) {
     pool.thread_count = numThreads;
     pool.shutdown = 0;
     pool.head = NULL;
     pool.tail = NULL;
+    pool.queue_size = 0;
+    pool.max_queue_size = maxQueue;
     pthread_mutex_init(&pool.lock,NULL);
     pthread_cond_init(&pool.notify,NULL);
 
@@ -66,13 +70,20 @@ void init_thread_pool(int numThreads) {
     }
 }
 
-void submit_task(void* (*function)(void*),void* args) {
+int submit_task(void* (*function)(void*),void* args) {
     Task* task = malloc(sizeof(Task));
     task->function = function;
     task->args = args;
     task->next = NULL;
 
     pthread_mutex_lock(&pool.lock);
+
+    if(pool.queue_size >= pool.max_queue_size) {
+        pthread_mutex_unlock(&pool.lock);
+        free(task);
+        return -1;
+    }
+
     if(pool.tail == NULL) {
         pool.head = task;
         pool.tail = task;
@@ -80,8 +91,10 @@ void submit_task(void* (*function)(void*),void* args) {
         pool.tail->next = task;
         pool.tail = pool.tail->next;
     }
+    pool.queue_size++;
     pthread_cond_signal(&pool.notify);
     pthread_mutex_unlock(&pool.lock);
+    return 0;
 }
 
 void destroy_thread_pool() {

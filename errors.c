@@ -3,7 +3,7 @@
 #include<string.h>
 #include<sys/socket.h>
 
-void send_error_response(int client_fd,int status_code,char *message) {
+void send_error_response(int client_fd,int status_code,const char *message,const char* extra_headers) {
     char response[1024];
     char *status_text;
 
@@ -20,17 +20,18 @@ void send_error_response(int client_fd,int status_code,char *message) {
         case 504: status_text = "Gateway Timeout"; break;
         default:  status_text = "Error"; break;
     }
-
+    const char* headers = extra_headers ? extra_headers : "";
     snprintf(response,sizeof(response),
-             "HTTP %d %s\r\n"
+             "HTTP/1.1 %d %s\r\n"
              "Content-Type:text/html\r\n"
              "Content-Length:%ld\r\n"
              "Connection:close\r\n"
+             "%s"
              "\r\n"
              "<html><body><h1>%d %s</h1><p>%s</p></body></html>",
-             status_code,status_text,strlen(message) + 50,status_code,status_text,message);
+             status_code,status_text,strlen(message) + 50,headers,status_code,status_text,message);
     
-    if(send(client_fd,response,strlen(response),0) == -1) {
+    if(send(client_fd,response,strlen(response),MSG_NOSIGNAL) == -1) {
        perror("Failed to send error response to client");
     }
 }

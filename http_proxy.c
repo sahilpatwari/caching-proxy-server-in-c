@@ -23,7 +23,7 @@
 #include"thread_pool.h"
 
 #define PORT "3490"
-#define BACKLOG 10
+#define BACKLOG SOMAXCONN
 #define BUFFER 8192
 
 // ATOMIC REQUEST ID COUNTER
@@ -46,14 +46,14 @@ void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_
         snprintf(log_buf, sizeof(log_buf), "POST Body: %ld bytes", content_length);
         log_event(LEVEL_DEBUG, req_id, client_ip, log_buf);
     } else {
-        send_error_response(client_fd,411, "Content-Length Required");
+        send_error_response(client_fd,411, "Content-Length Required",NULL);
         log_event(LEVEL_WARN, req_id, client_ip,"Content-Length Required");
         return;
     }
 
     int serverfd = connect_to_host(req->hostname,req->port);
     if(serverfd == -1) {
-        send_error_response(client_fd, 502, "Bad Gateway: Could not connect to remote server");
+        send_error_response(client_fd, 502, "Bad Gateway: Could not connect to remote server",NULL);
         snprintf(log_buf, sizeof(log_buf), "Upstream connection failed: %s", req->hostname);
         log_event(LEVEL_ERROR, req_id, client_ip, log_buf);
         return;
@@ -73,7 +73,7 @@ void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_
     char* headers_copy = malloc(header_end_idx + 1);
     if(!headers_copy) {
         perror("malloc");
-        send_error_response(client_fd,500,"Internal Server Error");
+        send_error_response(client_fd,500,"Internal Server Error",NULL);
         log_event(LEVEL_ERROR, req_id, client_ip, "Malloc failed for headers");
         close(serverfd);
         return;
@@ -100,7 +100,7 @@ void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_
     while(header_len > 0) {
         int n;
         if((n = send(serverfd,header_buffer,strlen(header_buffer),MSG_NOSIGNAL)) == -1) {
-            send_error_response(client_fd, 502, "Bad Gateway");
+            send_error_response(client_fd, 502, "Bad Gateway",NULL);
             log_event(LEVEL_ERROR, req_id, client_ip, "Failed to send headers to upstream");
             close(serverfd);
             return;
@@ -191,22 +191,40 @@ void* handle_client(void* args) {
     }
     
     //RATE LIMIT
-    if(!check_rate_limit(client_ip)) {
+    /*if(!check_rate_limit(client_ip)) {
         printf("[Rate Limit] Denied: %s\n", client_ip);
         log_event(LEVEL_WARN, req_id, client_ip, "Rate Limit Exceeded (429)");
-        send_error_response(newfd, 429, "Too Many Requests. Slow down.");
+        send_error_response(newfd, 429, "Too Many Requests. Slow down.",NULL);
         close(newfd);
         return NULL;
-    }
+    }*/
     char buffer[BUFFER];
     printf("Client Connected\n");
-    int bytes_received = recv(newfd,buffer,BUFFER - 1,0);
-    if(bytes_received < 0) {
-        perror("recv");
-        send_error_response(newfd, 400, "Failed to read request.");
-        close(newfd);
-        return NULL;
-    } else if(bytes_received == 0) {
+    int bytes_received = 0;
+    //Ensuring that we receive upto the header part of the request
+    while(bytes_received < BUFFER - 1) {
+        int n = recv(newfd,buffer + bytes_received,BUFFER - 1 - bytes_received,0);
+
+        if(n < 0) {
+            perror("recv");
+            send_error_response(newfd, 400, "Failed to read request.",NULL);
+            close(newfd);
+            return NULL;
+        } else if(n == 0) {
+            //Client disconnected prematurely
+            break;
+        }
+
+        bytes_received += n;
+        buffer[bytes_received] = '\0';
+
+        if(strstr(buffer,"\r\n\r\n") != NULL) {
+            break;
+        }
+    }
+    
+    if(bytes_received == 0 || strstr(buffer,"\r\n\r\n") == NULL) {
+        send_error_response(newfd,400,"Incomplete or Empty Request",NULL);
         close(newfd);
         return NULL;
     }
@@ -216,7 +234,7 @@ void* handle_client(void* args) {
     char method[16],url[5120],protocol[16];
     int count = sscanf(buffer,"%15s %5119s %15s",method,url,protocol);
     if(count != 3) {
-       send_error_response(newfd, 400, "Invalid HTTP Request Format.");
+       send_error_response(newfd, 400, "Invalid HTTP Request Format.",NULL);
        log_event(LEVEL_WARN, req_id, client_ip, "Malformed Request");
        close(newfd);
        return NULL;
@@ -224,7 +242,7 @@ void* handle_client(void* args) {
     
     struct ProxyRequest req;
     if(parse_url(url,&req) != 0) {
-        send_error_response(newfd, 400, "Invalid URL Format.");
+        send_error_response(newfd, 400, "Invalid URL Format.",NULL);
         log_event(LEVEL_WARN, req_id, client_ip, "Invalid URL");
         close(newfd);
         return NULL;
@@ -251,7 +269,7 @@ void* handle_client(void* args) {
 
         int serverfd = connect_to_host(req.hostname,req.port);
         if(serverfd == -1) {
-            send_error_response(newfd, 502, "Bad Gateway: Could not connect to remote server");
+            send_error_response(newfd, 502, "Bad Gateway: Could not connect to remote server",NULL);
             snprintf(log_buf, sizeof(log_buf), "Upstream connection failed: %s", req.hostname);
             log_event(LEVEL_ERROR, req_id, client_ip, log_buf);
             close(newfd);
@@ -278,7 +296,7 @@ void* handle_client(void* args) {
 
         if(send(serverfd,new_req,strlen(new_req),0) == -1) {
             perror("Upstream send failed");
-            send_error_response(newfd, 503, "Service Unavailable");
+            send_error_response(newfd, 503, "Service Unavailable",NULL);
             snprintf(log_buf, sizeof(log_buf), "Failed to send headers to: %s", req.hostname);
             log_event(LEVEL_ERROR, req_id, client_ip, log_buf);
             close(serverfd);
@@ -292,7 +310,7 @@ void* handle_client(void* args) {
         printf("[Proxy] Tunneling POST Request\n");
         handle_tunnel_request(newfd, &req, buffer, bytes_received,method,url,protocol,client_ip,req_id);
     } else {
-        send_error_response(newfd,501,"Not Implemented");
+        send_error_response(newfd,501,"Not Implemented",NULL);
         log_event(LEVEL_WARN, req_id, client_ip, "Unsupported Method");
     }
     close(newfd);
@@ -348,7 +366,7 @@ int main() {
     printf("Server is listening\n");
     global_req_id = (uint64_t)time(NULL) << 16;
     printf("Proxy Server started. Initial Req ID: %" PRIu64 "\n", global_req_id);
-    init_thread_pool(100);
+    init_thread_pool(100,4096);
     while(1) {
         sin_size = sizeof their_addr;
         newfd = accept(sockfd,(struct sockaddr*)&their_addr,&sin_size);
@@ -364,7 +382,12 @@ int main() {
         }
 
         args->client_fd = newfd;
-        submit_task(handle_client,(void*) args);
+        if(submit_task(handle_client,(void*) args) == -1) {
+            printf("[System] Proxy overloaded. Dropping connection.\n");
+            send_error_response(newfd, 503, "Service Unavailable: Server Overloaded","Retry: 5\r\n");
+            close(newfd);
+            free(args);
+        }
     }
     return 0;
 }
