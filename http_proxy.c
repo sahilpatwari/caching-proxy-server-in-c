@@ -191,13 +191,13 @@ void* handle_client(void* args) {
     }
     
     //RATE LIMIT
-    /*if(!check_rate_limit(client_ip)) {
+    if(!check_rate_limit(client_ip)) {
         printf("[Rate Limit] Denied: %s\n", client_ip);
         log_event(LEVEL_WARN, req_id, client_ip, "Rate Limit Exceeded (429)");
         send_error_response(newfd, 429, "Too Many Requests. Slow down.",NULL);
         close(newfd);
         return NULL;
-    }*/
+    }
     char buffer[BUFFER];
     printf("Client Connected\n");
     int bytes_received = 0;

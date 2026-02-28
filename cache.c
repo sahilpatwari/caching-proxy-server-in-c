@@ -15,6 +15,8 @@
 #define MAX_CACHE_SIZE 10*1024*1024 
 #define BUFFER 8192
 
+static pthread_mutex_t eviction_lock = PTHREAD_MUTEX_INITIALIZER;
+
 typedef struct {
     char filename[256];
     time_t mtime;
@@ -104,6 +106,11 @@ int compare_cache_entries(const void* a,const void* b) {
 }
 
 void enforce_cache_capacity() {
+
+    if(pthread_mutex_trylock(&eviction_lock) != 0) {
+        return;
+    }
+
     DIR *d;
     struct dirent *dir;
     struct stat filestat;
@@ -113,6 +120,7 @@ void enforce_cache_capacity() {
     CacheEntry *entries = malloc(max_files*sizeof(CacheEntry));
     if(!entries) {
         perror("malloc");
+        pthread_mutex_unlock(&eviction_lock);
         return;
     }
     int count = 0;
@@ -122,6 +130,7 @@ void enforce_cache_capacity() {
     if(!d) {
         fprintf(stderr,"Could not open directory");
         free(entries);
+        pthread_mutex_unlock(&eviction_lock);
         return;
     }
     
@@ -142,26 +151,28 @@ void enforce_cache_capacity() {
         }
     }
     closedir(d);
-    
-    qsort(entries,count,sizeof(CacheEntry),compare_cache_entries);
-    int i = 0;
-    while(total_size > MAX_CACHE_SIZE && i < count) {
-           printf("Cache Overflow (%ld/%d bytes). Evicting %s\n",total_size,MAX_CACHE_SIZE,entries[i].filename);
-           if(remove(entries[i].filename) == 0) {
-               total_size -= entries[i].size;
-           } else {
-               perror("Failed to delete cache file");
-           }
-           i++;
+    if(total_size > MAX_CACHE_SIZE) {
+        qsort(entries,count,sizeof(CacheEntry),compare_cache_entries);
+        int i = 0;
+        while(total_size > MAX_CACHE_SIZE && i < count) {
+            printf("Cache Overflow (%ld/%d bytes). Evicting %s\n",total_size,MAX_CACHE_SIZE,entries[i].filename);
+            if(remove(entries[i].filename) == 0) {
+                total_size -= entries[i].size;
+            } else {
+                perror("Failed to delete cache file");
+            }
+            i++;
+        }
     }
     free(entries);
+    pthread_mutex_unlock(&eviction_lock);
 }
 
 void serve_from_cache(int client_fd,char* url,char* client_ip,char* cache_file,uint64_t req_id) {
     FILE *fp = fopen(cache_file,"rb");
 
     if (!fp) {
-        send_error_response(client_fd, 500, "Internal Cache Error");
+        send_error_response(client_fd, 500, "Internal Cache Error",NULL);
         log_event(LEVEL_ERROR, req_id, client_ip, "Cache Hit but failed to open file");
         return;
     }
@@ -263,7 +274,7 @@ void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* 
     } else if (n < 0) {
         log_event(LEVEL_ERROR, req_id, client_ip, "Upstream recv error");
         if (!has_sent_headers) {
-            send_error_response(client_fd, 502, "Bad Gateway: Upstream Error");
+            send_error_response(client_fd, 502, "Bad Gateway: Upstream Error",NULL);
         }
     }
 

@@ -9,8 +9,9 @@
 
 #define RATE_LIMITER_CAPACITY 10
 #define REFILL_RATE 1
-#define CLIENT_TIMEOUT 60      // Remove client if inactive for 60s
-#define CLEANUP_INTERVAL 30    // Run cleanup every 30s
+#define CLIENT_TIMEOUT 300      // Remove client if inactive for 300s
+#define CLEANUP_INTERVAL 120    // Run cleanup every 120s
+#define HASH_TABLE_SIZE 4096
 
 typedef struct ClientNode{
     char ip[INET6_ADDRSTRLEN];
@@ -20,38 +21,50 @@ typedef struct ClientNode{
 }ClientNode;
 
 static pthread_mutex_t limit_lock = PTHREAD_MUTEX_INITIALIZER;
-static ClientNode* head = NULL;
+static ClientNode* hash_table[HASH_TABLE_SIZE];
 pthread_t cleaner_thread;
 static int running =1;
+
+//djb2 hash algorithm
+static unsigned long hash_ip(const char* str) {
+    unsigned long hash = 5381;
+    int c;
+    while((c = *str++)) {
+        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+    }
+    return hash % HASH_TABLE_SIZE;
+}
 
 void* prune_stale_clients(void* args) {
     while(running) {
        sleep(CLEANUP_INTERVAL);
 
         time_t now = time(NULL);
-        pthread_mutex_lock(&limit_lock);
-
-        ClientNode* current = head;
-        ClientNode* prev = NULL;
         int pruned_count = 0;
+        pthread_mutex_lock(&limit_lock);
+        
+        for(int i = 0; i < HASH_TABLE_SIZE; i++) {
+            ClientNode* current = hash_table[i];
+            ClientNode* prev = NULL;
 
-        while(current != NULL) {
-            if(difftime(now,current->last_refill) > CLIENT_TIMEOUT) {
-                ClientNode* to_free = current;
+            while(current != NULL) {
+                if(difftime(now,current->last_refill) > CLIENT_TIMEOUT) {
+                    ClientNode* to_free = current;
 
-                if(prev == NULL) {
-                    head = current->next;
-                    current = head;
+                    if(prev == NULL) {
+                        hash_table[i] = current->next;
+                        current = hash_table[i];
+                    } else {
+                        prev->next = current->next;
+                        current = current->next;
+                    }
+
+                    free(to_free);
+                    pruned_count++;
                 } else {
-                    prev->next = current->next;
+                    prev = current;
                     current = current->next;
                 }
-
-                free(to_free);
-                pruned_count++;
-            } else {
-                prev = current;
-                current = current->next;
             }
         }
 
@@ -64,14 +77,16 @@ void* prune_stale_clients(void* args) {
     return NULL;
 }
 void init_rate_limiter() {
+    memset(hash_table,0,sizeof(hash_table));
     if (pthread_create(&cleaner_thread, NULL, prune_stale_clients, NULL) != 0) {
         perror("Failed to start rate limiter cleanup thread");
     }
 }
 
 int check_rate_limit(char* client_ip) {
+    unsigned long bucket = hash_ip(client_ip);
     pthread_mutex_lock(&limit_lock);
-    ClientNode* target = head;
+    ClientNode* target = hash_table[bucket];
     while(target != NULL) {
         if(strcmp(target->ip,client_ip) == 0) {
             break;
@@ -89,8 +104,8 @@ int check_rate_limit(char* client_ip) {
             target->ip[INET6_ADDRSTRLEN] = '\0';
             target->tokens = RATE_LIMITER_CAPACITY;
             target->last_refill = time(NULL);
-            target->next = head;
-            head = target;
+            target->next = hash_table[bucket];
+            hash_table[bucket] = target;
         }
     }
 
@@ -105,7 +120,7 @@ int check_rate_limit(char* client_ip) {
         target->last_refill = now;
     }
     int allowed = 0;
-    if(target->tokens > 1.0) {
+    if(target->tokens >= 1.0) {
         target->tokens -= 1.0;
         allowed = 1;
     } else {
@@ -121,10 +136,14 @@ void destroy_rate_limiter() {
     pthread_cancel(cleaner_thread);
     pthread_join(cleaner_thread,NULL);
     pthread_mutex_lock(&limit_lock);
-    while(head != NULL) {
-        ClientNode* del = head;
-        head = head->next;
-        free(del);
+    for(int i = 0; i < HASH_TABLE_SIZE; i++) {
+        ClientNode* head = hash_table[i];
+        while(head != NULL) {
+            ClientNode* del = head;
+            head = head->next;
+            free(del);
+        }
+        hash_table[i] = NULL;
     }
     pthread_mutex_unlock(&limit_lock);
 }
