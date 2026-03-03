@@ -14,6 +14,7 @@
 #include <time.h>
 #include <stdint.h> 
 #include <inttypes.h>
+#include <sys/time.h>
 
 #include"proxy.h"
 #include"cache.h"
@@ -190,129 +191,142 @@ void* handle_client(void* args) {
         strcpy(client_ip,"UNKNOWN");
     }
     
-    //RATE LIMIT
-    if(!check_rate_limit(client_ip)) {
-        printf("[Rate Limit] Denied: %s\n", client_ip);
-        log_event(LEVEL_WARN, req_id, client_ip, "Rate Limit Exceeded (429)");
-        send_error_response(newfd, 429, "Too Many Requests. Slow down.",NULL);
-        close(newfd);
-        return NULL;
+    struct timeval timeout;      
+    timeout.tv_sec = 5;  // 5 seconds idle timeout
+    timeout.tv_usec = 0;
+    if (setsockopt(newfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout)) < 0) {
+        perror("setsockopt RCVTIMEO");
     }
-    char buffer[BUFFER];
-    printf("Client Connected\n");
-    int bytes_received = 0;
-    //Ensuring that we receive upto the header part of the request
-    while(bytes_received < BUFFER - 1) {
-        int n = recv(newfd,buffer + bytes_received,BUFFER - 1 - bytes_received,0);
-
-        if(n < 0) {
-            perror("recv");
-            send_error_response(newfd, 400, "Failed to read request.",NULL);
-            close(newfd);
-            return NULL;
-        } else if(n == 0) {
-            //Client disconnected prematurely
+    if (setsockopt(newfd, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout)) < 0) {
+        perror("setsockopt SNDTIMEO");
+    }
+    int keep_alive = 1;
+    while(keep_alive) {
+        //RATE LIMIT
+        if(!check_rate_limit(client_ip)) {
+            printf("[Rate Limit] Denied: %s\n", client_ip);
+            log_event(LEVEL_WARN, req_id, client_ip, "Rate Limit Exceeded (429)");
+            send_error_response(newfd, 429, "Too Many Requests. Slow down.",NULL);
             break;
         }
 
-        bytes_received += n;
-        buffer[bytes_received] = '\0';
+        char buffer[BUFFER];
+        memset(buffer,0,BUFFER);
+        printf("Client Connected\n");
+        int bytes_received = 0;
+        //Ensuring that we receive upto the header part of the request
+        while(bytes_received < BUFFER - 1) {
+            int n = recv(newfd,buffer + bytes_received,BUFFER - 1 - bytes_received,MSG_NOSIGNAL);
 
-        if(strstr(buffer,"\r\n\r\n") != NULL) {
-            break;
-        }
-    }
-    
-    if(bytes_received == 0 || strstr(buffer,"\r\n\r\n") == NULL) {
-        send_error_response(newfd,400,"Incomplete or Empty Request",NULL);
-        close(newfd);
-        return NULL;
-    }
-
-    buffer[bytes_received] = '\0';
-    const char* response;
-    char method[16],url[5120],protocol[16];
-    int count = sscanf(buffer,"%15s %5119s %15s",method,url,protocol);
-    if(count != 3) {
-       send_error_response(newfd, 400, "Invalid HTTP Request Format.",NULL);
-       log_event(LEVEL_WARN, req_id, client_ip, "Malformed Request");
-       close(newfd);
-       return NULL;
-    }
-    
-    struct ProxyRequest req;
-    if(parse_url(url,&req) != 0) {
-        send_error_response(newfd, 400, "Invalid URL Format.",NULL);
-        log_event(LEVEL_WARN, req_id, client_ip, "Invalid URL");
-        close(newfd);
-        return NULL;
-    }
-    printf("[Proxy] Request: %s %s\n", method, url);
-    char log_buf[1536];
-    snprintf(log_buf, sizeof(log_buf), "Request: %s %s:%d", method, req.hostname, req.port);
-    log_event(LEVEL_INFO, req_id, client_ip, log_buf);
-
-
-    if(strncmp(method,"GET",3) == 0) {
-        char cache_file[256];
-        get_cache_filename(url,cache_file);
-        printf("Checking cache: %s\n",cache_file);
-
-        if(check_cache(cache_file,url)) {
-            printf("[Cache] HIT: %s\n", url);
-            serve_from_cache(newfd,url,client_ip,cache_file,req_id);
-            close(newfd);
-            return NULL;
-        }
-
-        printf("[Cache] MISS: Fetching %s\n", url);
-
-        int serverfd = connect_to_host(req.hostname,req.port);
-        if(serverfd == -1) {
-            send_error_response(newfd, 502, "Bad Gateway: Could not connect to remote server",NULL);
-            snprintf(log_buf, sizeof(log_buf), "Upstream connection failed: %s", req.hostname);
-            log_event(LEVEL_ERROR, req_id, client_ip, log_buf);
-            close(newfd);
-            return NULL;
-        }
-        char new_req[BUFFER];
-        snprintf(new_req,sizeof(new_req),
-        "%s %s %s\r\nHost: %s\r\nConnection: close\r\n"
-        ,method,req.path,protocol,req.hostname);
-        
-        char *buffer_ptr;
-        char *token = strtok_r(buffer,"\r\n",&buffer_ptr);
-        while(token != NULL) {
-            if(strncmp(token,method,strlen(method)) == 0 || strncmp(token,"Host",4) == 0 || strncmp(token,"Connection",10) == 0) {
-                token = strtok_r(NULL,"\r\n",&buffer_ptr);
-                continue;
+            if(n < 0) {
+                perror("recv");
+                send_error_response(newfd, 400, "Failed to read request.",NULL);
+                break;
+            } else if(n == 0) {
+                //Client disconnected prematurely
+                break;
             }
-            snprintf(new_req + strlen(new_req),sizeof(new_req),"%s\r\n",token);
-            token = strtok_r(NULL,"\r\n",&buffer_ptr);
-        }
-        snprintf(new_req + strlen(new_req),sizeof(new_req),"\r\n");
-        printf("%s",new_req);
-        printf("Forwarding Request\n");
 
-        if(send(serverfd,new_req,strlen(new_req),0) == -1) {
-            perror("Upstream send failed");
-            send_error_response(newfd, 503, "Service Unavailable",NULL);
-            snprintf(log_buf, sizeof(log_buf), "Failed to send headers to: %s", req.hostname);
-            log_event(LEVEL_ERROR, req_id, client_ip, log_buf);
-            close(serverfd);
-            close(newfd);
-            return NULL;
+            bytes_received += n;
+            buffer[bytes_received] = '\0';
+
+            if(strstr(buffer,"\r\n\r\n") != NULL) {
+                break;
+            }
         }
         
-        fetch_and_cache(newfd,serverfd,url,client_ip,cache_file,req_id);
-        close(serverfd);
-    } else if(strncmp(method,"POST",4) == 0) {
-        printf("[Proxy] Tunneling POST Request\n");
-        handle_tunnel_request(newfd, &req, buffer, bytes_received,method,url,protocol,client_ip,req_id);
-    } else {
-        send_error_response(newfd,501,"Not Implemented",NULL);
-        log_event(LEVEL_WARN, req_id, client_ip, "Unsupported Method");
+        if(bytes_received == 0 || strstr(buffer,"\r\n\r\n") == NULL) {
+            send_error_response(newfd,400,"Incomplete or Empty Request",NULL);
+            break;
+        }
+        
+        if(strstr(buffer,"Connection:close") || strstr(buffer,"Connection: close")) {
+            keep_alive = 0;
+        }
+        
+        buffer[bytes_received] = '\0';
+        const char* response;
+        char method[16],url[5120],protocol[16];
+        int count = sscanf(buffer,"%15s %5119s %15s",method,url,protocol);
+        if(count != 3) {
+            send_error_response(newfd, 400, "Invalid HTTP Request Format.",NULL);
+            log_event(LEVEL_WARN, req_id, client_ip, "Malformed Request");
+            break;
+        }
+        
+        struct ProxyRequest req;
+        if(parse_url(url,&req) != 0) {
+            send_error_response(newfd, 400, "Invalid URL Format.",NULL);
+            log_event(LEVEL_WARN, req_id, client_ip, "Invalid URL");
+            break;
+        }
+        printf("[Proxy] Request: %s %s\n", method, url);
+        char log_buf[1536];
+        snprintf(log_buf, sizeof(log_buf), "Request: %s %s:%d", method, req.hostname, req.port);
+        log_event(LEVEL_INFO, req_id, client_ip, log_buf);
+
+
+        if(strncmp(method,"GET",3) == 0) {
+            char cache_file[256];
+            get_cache_filename(url,cache_file);
+            printf("Checking cache: %s\n",cache_file);
+
+            if(check_cache(cache_file,url)) {
+                printf("[Cache] HIT: %s\n", url);
+                serve_from_cache(newfd,url,client_ip,cache_file,req_id);
+                break;
+            }
+
+            printf("[Cache] MISS: Fetching %s\n", url);
+
+            int serverfd = connect_to_host(req.hostname,req.port);
+            if(serverfd == -1) {
+                send_error_response(newfd, 502, "Bad Gateway: Could not connect to remote server",NULL);
+                snprintf(log_buf, sizeof(log_buf), "Upstream connection failed: %s", req.hostname);
+                log_event(LEVEL_ERROR, req_id, client_ip, log_buf);
+                break;
+            }
+            char new_req[BUFFER];
+            snprintf(new_req,sizeof(new_req),
+            "%s %s %s\r\nHost: %s\r\nConnection: close\r\n"
+            ,method,req.path,protocol,req.hostname);
+            
+            char *buffer_ptr;
+            char *token = strtok_r(buffer,"\r\n",&buffer_ptr);
+            while(token != NULL) {
+                if(strncmp(token,method,strlen(method)) == 0 || strncmp(token,"Host",4) == 0 || strncmp(token,"Connection",10) == 0) {
+                    token = strtok_r(NULL,"\r\n",&buffer_ptr);
+                    continue;
+                }
+                snprintf(new_req + strlen(new_req),sizeof(new_req),"%s\r\n",token);
+                token = strtok_r(NULL,"\r\n",&buffer_ptr);
+            }
+            snprintf(new_req + strlen(new_req),sizeof(new_req),"\r\n");
+            printf("%s",new_req);
+            printf("Forwarding Request\n");
+
+            if(send(serverfd,new_req,strlen(new_req),MSG_NOSIGNAL) == -1) {
+                perror("Upstream send failed");
+                send_error_response(newfd, 503, "Service Unavailable",NULL);
+                snprintf(log_buf, sizeof(log_buf), "Failed to send headers to: %s", req.hostname);
+                log_event(LEVEL_ERROR, req_id, client_ip, log_buf);
+                close(serverfd);
+                break;
+            }
+            
+            fetch_and_cache(newfd,serverfd,url,client_ip,cache_file,req_id);
+            close(serverfd);
+        } else if(strncmp(method,"POST",4) == 0) {
+            printf("[Proxy] Tunneling POST Request\n");
+            handle_tunnel_request(newfd, &req, buffer, bytes_received,method,url,protocol,client_ip,req_id);
+            keep_alive = 0;
+        } else {
+            send_error_response(newfd,501,"Not Implemented",NULL);
+            log_event(LEVEL_WARN, req_id, client_ip, "Unsupported Method");
+            keep_alive = 0;
+        }
     }
+
     close(newfd);
     return NULL;
 }

@@ -65,6 +65,31 @@ int parse_cache_policy(char* response_buffer) {
     return ttl;
 }
 
+void filter_and_send_headers(int client_fd,char* header_block,int block_len) {
+    char* save_ptr;
+    char* headers_copy = malloc(block_len + 1);
+    char end_to_end_headers[block_len + 1];
+    end_to_end_headers[block_len] = '\0';
+    if(!headers_copy) return;
+    memcpy(headers_copy,header_block,block_len);
+    headers_copy[block_len] = '\0';
+
+    char* line = strtok_r(headers_copy,"\r\n",&save_ptr);
+    if(line) {
+        line = strtok_r(NULL,"\r\n",&save_ptr);
+    }
+    while(line != NULL) {
+        if(strncmp(line,"Connection:",11) == 0 || strncmp(line,"Keep-Alive:", 11) == 0 || strncmp(line,"Transfer-Encoding:", 18) == 0 || strncmp(line,"Upgrade:", 8) == 0 || strncmp(line,"Content-Length:",15) == 0) {
+            line = strtok_r(NULL,"\r\n",&save_ptr);
+            continue;
+        }
+        snprintf(end_to_end_headers + strlen(end_to_end_headers),sizeof(end_to_end_headers),"%s\r\n",line);
+        line = strtok_r(NULL,"\r\n",&save_ptr);
+    }
+    snprintf(end_to_end_headers + strlen(end_to_end_headers),sizeof(end_to_end_headers),"\r\n");
+    send(client_fd,end_to_end_headers,strlen(end_to_end_headers),MSG_NOSIGNAL);
+}
+
 int check_cache(char* filename,char* url) {
     FILE* fp = fopen(filename,"rb");
     if(!fp) return 0;
@@ -178,17 +203,34 @@ void serve_from_cache(int client_fd,char* url,char* client_ip,char* cache_file,u
     }
     
     log_event(LEVEL_DEBUG, req_id, client_ip, "Streaming from cache...");
-    if(fseek(fp,sizeof(CacheHeader),SEEK_SET) != 0) {
-        log_event(LEVEL_ERROR, req_id, client_ip, "Seek failed on cache file");
+    CacheHeader header;
+    if (fread(&header, sizeof(CacheHeader), 1, fp) != 1) {
         fclose(fp);
         return;
     }
     char file_buffer[BUFFER];
-    int bytes_read;
-    long total_sent = 0;
+    int bytes_read = fread(file_buffer,1,sizeof(file_buffer),fp);
+    char* body_ptr = strstr(file_buffer,"\r\n\r\n");
+    if(body_ptr) {
+        body_ptr += 4;
+        char initial_headers[256];
+        long content_length = header.content_length - (body_ptr - file_buffer);
+        snprintf(initial_headers, sizeof(initial_headers),
+                "HTTP/1.1 200 OK\r\n"
+                "Connection: keep-alive\r\n"
+                "Content-Length: %ld\r\n",
+                content_length);
+        send(client_fd, initial_headers, strlen(initial_headers), MSG_NOSIGNAL);
+        
+        filter_and_send_headers(client_fd,file_buffer,body_ptr - file_buffer);
+
+        int body_in_buffer = bytes_read - (body_ptr - file_buffer);
+        send(client_fd,body_ptr,body_in_buffer,MSG_NOSIGNAL);
+    }
+    long total_sent = bytes_read;
     int success = 1;
     while((bytes_read = fread(file_buffer,1,sizeof(file_buffer),fp)) > 0) {
-    if(send(client_fd, file_buffer, bytes_read, MSG_NOSIGNAL) == -1) {
+        if(send(client_fd, file_buffer, bytes_read, MSG_NOSIGNAL) == -1) {
             log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during cache stream");
             success = 0;
             break;
