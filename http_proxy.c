@@ -15,26 +15,398 @@
 #include <stdint.h> 
 #include <inttypes.h>
 #include <sys/time.h>
+#include <netinet/tcp.h>
+#include<errno.h>
+#include<fcntl.h>
+#include<sys/epoll.h>
 
-#include"proxy.h"
 #include"cache.h"
-#include"proxy_log.h"
-#include"errors.h"
 #include"rate_limiter.h"
 #include"thread_pool.h"
 
 #define PORT "3490"
 #define BACKLOG SOMAXCONN
 #define BUFFER 8192
+#define MAX_FDS 10000 
 
 // ATOMIC REQUEST ID COUNTER
 static _Atomic uint64_t global_req_id = 0;
+//EPOLL INSTANCE
+int epoll_fd;
 
-typedef struct {
-    int client_fd;
-}thread_args_t;
+ConnectionContext* context_table[MAX_FDS];
+ConnectionContext* create_context(int fd) {
+    if(fd >= MAX_FDS) return NULL;
+    ConnectionContext* ctx = calloc(1,sizeof(ConnectionContext));
+    if(!ctx) return NULL;
+    struct sockaddr_storage addr;
+    socklen_t addr_size = sizeof(addr);
+    if(getpeername(ctx->client_fd,(struct sockaddr*)&addr,&addr_size) == 0) {
+          if(getnameinfo((struct sockaddr*)&addr,addr_size,ctx->client_ip,sizeof(ctx->client_ip),NULL,0,NI_NUMERICHOST) == -1) {
+            strcpy(ctx->client_ip,"UNKNOWN");
+        }
+    } else {
+        strcpy(ctx->client_ip,"UNKNOWN");
+    }
+    
+    ctx->client_fd = fd;
+    ctx->upstream_fd = -1;
+    ctx->file_fd = -1;
+    // GENERATE ID
+    ctx->req_id = global_req_id++;
+    ctx->state = STATE_READ_REQUEST;
+    ctx->bytes_read = 0;
+    ctx->write_len = 0;
+    ctx->write_offset = 0;
+    ctx->bytes_remaining = 0;
+    ctx->keep_alive = 1;
+    context_table[fd] = ctx;
+    return ctx; 
+}
 
-void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_buffer,int initial_len,char* method,char* url,char* protocol,char* client_ip,uint64_t req_id) {
+void free_context(ConnectionContext* ctx) {
+     if (ctx == NULL) return;
+
+    if (ctx->upstream_fd != -1) {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->upstream_fd, NULL);
+        
+        context_table[ctx->upstream_fd] = NULL; 
+        
+        close(ctx->upstream_fd);
+        ctx->upstream_fd = -1;
+    }
+
+    if (ctx->client_fd != -1) {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->client_fd, NULL);
+        context_table[ctx->client_fd] = NULL;
+        close(ctx->client_fd);
+        ctx->client_fd = -1;
+    }
+
+    if (ctx->file_fd != -1) {
+        close(ctx->file_fd);
+        ctx->file_fd = -1;
+    }
+    free(ctx);
+}
+
+int make_socket_non_blocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) {
+        perror("fcntl F_GETFL");
+        return -1;
+    }
+    flags |= O_NONBLOCK;
+    if (fcntl(fd, F_SETFL, flags) == -1) {
+        perror("fcntl F_SETFL O_NONBLOCK");
+        return -1;
+    }
+    return 0;
+}
+
+void handle_send_response_headers(ConnectionContext* ctx) {
+    while(ctx->write_offset < ctx->write_len) {
+        int bytes_sent = send(ctx->client_fd,ctx->write_buf + ctx->write_offset,ctx->write_len - ctx->write_offset,MSG_NOSIGNAL);
+
+        if(bytes_sent < 0) {
+            if(errno == EWOULDBLOCK || errno == EAGAIN) return;
+            perror("Client send error");
+            ctx->state = STATE_CLOSE;
+            return;
+        } else if (bytes_sent == 0) {
+            ctx->state = STATE_CLOSE; // Client hung up early
+            return;
+        }
+
+        ctx->write_offset += bytes_sent;
+    }
+    ctx->state = STATE_SEND_CACHE;
+
+    handle_send_cache(ctx);
+}
+void handle_send_upstream(ConnectionContext* ctx) {
+    
+    if(ctx->write_len == 0) {
+        ctx->write_len = snprintf(ctx->write_buf,sizeof(ctx->write_buf),
+        "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n"
+        ,ctx->method,(ctx->req).path,(ctx->req).hostname);
+
+        ctx->write_offset = 0;
+        char *buffer_ptr;
+        char* headers_copy = malloc(BUFFER + 1);
+        headers_copy[BUFFER] ='\0';
+        strncpy(headers_copy,ctx->read_buf,BUFFER);
+        char *token = strtok_r(headers_copy,"\r\n",&buffer_ptr);
+        while(token != NULL) {
+            if(strncmp(token,ctx->method,strlen(ctx->method)) == 0 || strncmp(token,"Host",4) == 0 || strncmp(token,"Connection",10) == 0) {
+                token = strtok_r(NULL,"\r\n",&buffer_ptr);
+                continue;
+            }
+            ctx->write_len += snprintf(ctx->write_buf + strlen(ctx->write_buf),sizeof(ctx->write_buf),"%s\r\n",token);
+            token = strtok_r(NULL,"\r\n",&buffer_ptr);
+        }
+        ctx->write_len += snprintf(ctx->write_buf + strlen(ctx->write_buf),sizeof(ctx->write_buf),"\r\n");
+        free(headers_copy);
+    }
+
+    while(ctx->write_offset < ctx->write_len) {
+        int bytes_sent = send(ctx->upstream_fd,ctx->write_buf + ctx->write_offset,ctx->write_len - ctx->write_offset,MSG_NOSIGNAL);
+
+        if(bytes_sent < 0) {
+            if(errno == EWOULDBLOCK || errno == EAGAIN) {
+                return;
+            }
+            perror("upstream send error");
+            ctx->state = STATE_CLOSE;
+            return;
+        } else if(bytes_sent == 0) {
+            ctx->state = STATE_CLOSE;
+            return;
+        }
+
+        ctx->write_offset += bytes_sent;
+    }
+    ctx->state = STATE_FETCH_UPSTREAM;
+    return;
+}
+
+void handle_connect_upstream(ConnectionContext* ctx) {
+    struct addrinfo hints, *res, *p;
+    int sockfd,status,connect_res = -1;
+
+    char port_str[16];
+    snprintf(port_str,sizeof(port_str),"%d",(ctx->req).port);
+    
+    memset(&hints,0,sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if((status = getaddrinfo((ctx->req).hostname,port_str,&hints,&res)) == -1) {
+        fprintf(stderr,"getaddrinfo: %s\n",gai_strerror(status));
+        send_error_response(ctx->client_fd, 502, "Bad Gateway", NULL);
+        ctx->state = STATE_CLOSE;
+        return;
+    }
+
+    for(p = res;p != NULL;p = p->ai_next) {
+        if((sockfd = socket(p->ai_family,p->ai_socktype,p->ai_protocol)) == -1) {
+            continue;
+        }
+        
+        make_socket_non_blocking(sockfd);
+
+        connect_res = connect(sockfd,p->ai_addr,p->ai_addrlen);
+
+        if(connect_res == 0) {
+            break;
+        } else if(connect_res < 0 && errno == EINPROGRESS){
+            break;
+        }
+
+        close(sockfd);
+        sockfd = -1;
+    }
+    freeaddrinfo(res);
+    if(p == NULL) {
+        fprintf(stderr,"The proxy couldn't connect to host %s\n",(ctx->req).hostname);
+        send_error_response(ctx->client_fd, 502, "Bad Gateway", NULL);
+        ctx->state = STATE_CLOSE;
+        return;
+    }
+    
+    ctx->upstream_fd = sockfd;
+    context_table[sockfd] = ctx;
+    
+    struct epoll_event event;
+    event.data.fd = sockfd;
+    event.events = EPOLLOUT | EPOLLONESHOT;
+    if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sockfd, &event) == -1) {
+        perror("epoll_ctl add upstream");
+        ctx->state = STATE_CLOSE;
+        return;
+    }
+
+    if(connect_res == 0) {
+        ctx->state = STATE_SEND_UPSTREAM;
+    } else {
+        ctx->state = STATE_WAIT_CONNECT;
+    }
+    return;
+}
+
+void handle_wait_connect(ConnectionContext *ctx) {
+    int error = 0;
+    socklen_t len = sizeof(error);
+    
+    if (getsockopt(ctx->upstream_fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
+        perror("getsockopt failed");
+        ctx->state = STATE_CLOSE;
+        return;
+    }
+
+    if (error != 0) {
+        fprintf(stderr, "Upstream connection failed: %s\n", strerror(error));
+        send_error_response(ctx->client_fd, 502, "Bad Gateway", NULL);
+        ctx->state = STATE_CLOSE;
+        return;
+    }
+
+    ctx->state = STATE_SEND_UPSTREAM;
+    handle_send_upstream(ctx); 
+}
+
+void handle_parse_request(ConnectionContext* ctx) {
+    //RATE LIMIT
+    /*if(!check_rate_limit(ctx->client_ip)) {
+        printf("[Rate Limit] Denied: %s\n", ctx->client_ip);
+        log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, "Rate Limit Exceeded (429)");
+        send_error_response(ctx->client_fd, 429, "Too Many Requests. Slow down.",NULL);
+        ctx->state = STATE_CLOSE;
+        return;
+    }*/
+
+    if(strstr(ctx->read_buf,"Connection:close") || strstr(ctx->read_buf,"Connection: close")) {
+        ctx->keep_alive = 0;
+    } else {
+        ctx->keep_alive = 1;
+    }
+    
+    ctx->read_buf[ctx->bytes_read] = '\0';
+    int count = sscanf(ctx->read_buf,"%15s %5119s %15s",ctx->method,ctx->url,ctx->protocol);
+    if(count != 3) {
+        send_error_response(ctx->client_fd, 400, "Invalid HTTP Request Format.",NULL);
+        log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, "Malformed Request");
+        ctx->state = STATE_CLOSE;
+        return;
+    }
+
+    if(parse_url(ctx->url,&(ctx->req)) != 0) {
+        send_error_response(ctx->client_fd, 400, "Invalid URL Format.",NULL);
+        log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, "Invalid URL");
+        ctx->state = STATE_CLOSE;
+        return;
+    }
+    //printf("[Proxy] Request: %s %s\n", method, url);
+    char log_buf[1536];
+    snprintf(log_buf, sizeof(log_buf), "Request: %s %s:%d", ctx->method, (ctx->req).hostname, (ctx->req).port);
+    log_event(LEVEL_INFO, ctx->req_id, ctx->client_ip, log_buf);
+
+    if(strncmp(ctx->method,"GET",3) == 0) {
+        ctx->state = STATE_CHECK_CACHE;
+        ctx->checkCache = 1;
+        handle_check_cache(ctx);
+    } else if(strncmp(ctx->method,"POST",4) == 0) {
+        /*ctx->state = STATE_TUNNELING;
+        handle_tunnel_request(ctx);*/
+    } else {
+        send_error_response(ctx->client_fd,501,"Not Implemented",NULL);
+        log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, "Unsupported Method");
+    }
+    return;
+}
+
+void handle_read_request(ConnectionContext* ctx) {
+    while(1) {
+        int n = recv(ctx->client_fd,ctx->read_buf + ctx->bytes_read,BUFFER - 1 - ctx->bytes_read,MSG_NOSIGNAL);
+
+        if(n < 0) {
+            if(errno == EWOULDBLOCK || errno == EAGAIN) {
+                return;
+            }
+            if (errno != ECONNRESET) perror("recv error");
+            ctx->state = STATE_CLOSE;
+            return;
+        } else if(n == 0) {
+            //Client disconnected prematurely
+            ctx->state = STATE_CLOSE;
+            return;
+        }
+
+        ctx->bytes_read += n;
+        ctx->read_buf[ctx->bytes_read] = '\0';
+
+        if(strstr(ctx->read_buf,"\r\n\r\n") != NULL) {
+            ctx->state = STATE_PARSE_REQUEST;
+            handle_parse_request(ctx);
+            return;
+        }
+    }
+}
+void* handle_state_machine(void* args) {
+    ConnectionContext* ctx = (ConnectionContext*)args;
+    
+    if(ctx == NULL) return NULL;
+    switch(ctx->state) {
+        case STATE_READ_REQUEST:
+            handle_read_request(ctx);
+            break;
+        case STATE_PARSE_REQUEST:
+            handle_parse_request(ctx);
+            break;
+        case STATE_CHECK_CACHE:
+            handle_check_cache(ctx);
+            break;
+        case STATE_SEND_CACHE:
+            handle_send_cache(ctx);
+            break;
+        case STATE_CONNECT_UPSTREAM:
+            handle_connect_upstream(ctx);
+            break;
+        case STATE_WAIT_CONNECT:
+            handle_wait_connect(ctx);
+            break;
+        case STATE_SEND_UPSTREAM:
+            handle_send_upstream(ctx);
+            break;
+        case STATE_FETCH_UPSTREAM:
+            handle_fetch_upstream(ctx);
+            break;
+        case STATE_SEND_RESPONSE_HEADERS:
+            handle_send_response_headers(ctx);
+            break;
+        /*case STATE_TUNNELING:
+            handle_tunnel_request(ctx);
+            break;*/
+        case STATE_CLOSE:
+            free_context(ctx);
+            return NULL;  
+    }
+
+    if(ctx->state != STATE_CLOSE) {
+        struct epoll_event event;
+        if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM || ctx->state == STATE_FETCH_UPSTREAM) {
+            event.data.fd = ctx->upstream_fd;
+            if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM) {
+                event.events = EPOLLOUT | EPOLLONESHOT;
+            } else {
+                event.events = EPOLLIN | EPOLLONESHOT;
+            }
+            
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ctx->upstream_fd, &event) == -1) {
+                perror("epoll_ctl mod upstream failed");
+                ctx->state = STATE_CLOSE; 
+                free_context(ctx);
+            }
+        } else if(ctx->state == STATE_READ_REQUEST ||  ctx->state == STATE_SEND_RESPONSE_HEADERS || ctx->state == STATE_SEND_CACHE) {
+            event.data.fd = ctx->client_fd;
+            if(ctx->state == STATE_SEND_CACHE || ctx->state == STATE_SEND_RESPONSE_HEADERS) {
+                event.events = EPOLLOUT | EPOLLONESHOT;
+            } else {
+                event.events = EPOLLIN | EPOLLONESHOT;
+            }
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ctx->client_fd, &event) == -1) {
+                perror("epoll_ctl mod client failed");
+                ctx->state = STATE_CLOSE; 
+                free_context(ctx);
+            }
+        }
+    } else {
+        free_context(ctx);
+    }
+    return NULL;
+}
+
+/*void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_buffer,int initial_len,char* method,char* url,char* protocol,char* client_ip,uint64_t req_id) {
     
     char log_buf[1536];
     snprintf(log_buf, sizeof(log_buf), "Tunnel Start: %s:%d", req->hostname, req->port);
@@ -170,166 +542,8 @@ void handle_tunnel_request(int client_fd,struct ProxyRequest *req,char* initial_
     log_event(LEVEL_INFO, req_id, client_ip, log_buf);
     printf("Total Bytes relayed: %ld bytes\n",total_bytes);
     close(serverfd);
-}
+}*/
 
-void* handle_client(void* args) {
-    thread_args_t *thread_args = (thread_args_t*)args;
-    int newfd = thread_args->client_fd;
-    free(thread_args);
-    
-    // GENERATE ID
-    uint64_t req_id = global_req_id++;
-
-    struct sockaddr_storage addr;
-    socklen_t addr_size = sizeof(addr);
-    char client_ip[INET6_ADDRSTRLEN];
-    if(getpeername(newfd,(struct sockaddr*)&addr,&addr_size) == 0) {
-          if(getnameinfo((struct sockaddr*)&addr,addr_size,client_ip,sizeof(client_ip),NULL,0,NI_NUMERICHOST) != 0) {
-            strcpy(client_ip,"UNKNOWN");
-        }
-    } else {
-        strcpy(client_ip,"UNKNOWN");
-    }
-    
-    struct timeval timeout;      
-    timeout.tv_sec = 5;  // 5 seconds idle timeout
-    timeout.tv_usec = 0;
-    if (setsockopt(newfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout)) < 0) {
-        perror("setsockopt RCVTIMEO");
-    }
-    if (setsockopt(newfd, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout)) < 0) {
-        perror("setsockopt SNDTIMEO");
-    }
-    int keep_alive = 1;
-    while(keep_alive) {
-        //RATE LIMIT
-        if(!check_rate_limit(client_ip)) {
-            printf("[Rate Limit] Denied: %s\n", client_ip);
-            log_event(LEVEL_WARN, req_id, client_ip, "Rate Limit Exceeded (429)");
-            send_error_response(newfd, 429, "Too Many Requests. Slow down.",NULL);
-            break;
-        }
-
-        char buffer[BUFFER];
-        memset(buffer,0,BUFFER);
-        printf("Client Connected\n");
-        int bytes_received = 0;
-        //Ensuring that we receive upto the header part of the request
-        while(bytes_received < BUFFER - 1) {
-            int n = recv(newfd,buffer + bytes_received,BUFFER - 1 - bytes_received,MSG_NOSIGNAL);
-
-            if(n < 0) {
-                perror("recv");
-                send_error_response(newfd, 400, "Failed to read request.",NULL);
-                break;
-            } else if(n == 0) {
-                //Client disconnected prematurely
-                break;
-            }
-
-            bytes_received += n;
-            buffer[bytes_received] = '\0';
-
-            if(strstr(buffer,"\r\n\r\n") != NULL) {
-                break;
-            }
-        }
-        
-        if(bytes_received == 0 || strstr(buffer,"\r\n\r\n") == NULL) {
-            send_error_response(newfd,400,"Incomplete or Empty Request",NULL);
-            break;
-        }
-        
-        if(strstr(buffer,"Connection:close") || strstr(buffer,"Connection: close")) {
-            keep_alive = 0;
-        }
-        
-        buffer[bytes_received] = '\0';
-        const char* response;
-        char method[16],url[5120],protocol[16];
-        int count = sscanf(buffer,"%15s %5119s %15s",method,url,protocol);
-        if(count != 3) {
-            send_error_response(newfd, 400, "Invalid HTTP Request Format.",NULL);
-            log_event(LEVEL_WARN, req_id, client_ip, "Malformed Request");
-            break;
-        }
-        
-        struct ProxyRequest req;
-        if(parse_url(url,&req) != 0) {
-            send_error_response(newfd, 400, "Invalid URL Format.",NULL);
-            log_event(LEVEL_WARN, req_id, client_ip, "Invalid URL");
-            break;
-        }
-        printf("[Proxy] Request: %s %s\n", method, url);
-        char log_buf[1536];
-        snprintf(log_buf, sizeof(log_buf), "Request: %s %s:%d", method, req.hostname, req.port);
-        log_event(LEVEL_INFO, req_id, client_ip, log_buf);
-
-
-        if(strncmp(method,"GET",3) == 0) {
-            char cache_file[256];
-            get_cache_filename(url,cache_file);
-            printf("Checking cache: %s\n",cache_file);
-
-            if(check_cache(cache_file,url)) {
-                printf("[Cache] HIT: %s\n", url);
-                serve_from_cache(newfd,url,client_ip,cache_file,req_id);
-                break;
-            }
-
-            printf("[Cache] MISS: Fetching %s\n", url);
-
-            int serverfd = connect_to_host(req.hostname,req.port);
-            if(serverfd == -1) {
-                send_error_response(newfd, 502, "Bad Gateway: Could not connect to remote server",NULL);
-                snprintf(log_buf, sizeof(log_buf), "Upstream connection failed: %s", req.hostname);
-                log_event(LEVEL_ERROR, req_id, client_ip, log_buf);
-                break;
-            }
-            char new_req[BUFFER];
-            snprintf(new_req,sizeof(new_req),
-            "%s %s %s\r\nHost: %s\r\nConnection: close\r\n"
-            ,method,req.path,protocol,req.hostname);
-            
-            char *buffer_ptr;
-            char *token = strtok_r(buffer,"\r\n",&buffer_ptr);
-            while(token != NULL) {
-                if(strncmp(token,method,strlen(method)) == 0 || strncmp(token,"Host",4) == 0 || strncmp(token,"Connection",10) == 0) {
-                    token = strtok_r(NULL,"\r\n",&buffer_ptr);
-                    continue;
-                }
-                snprintf(new_req + strlen(new_req),sizeof(new_req),"%s\r\n",token);
-                token = strtok_r(NULL,"\r\n",&buffer_ptr);
-            }
-            snprintf(new_req + strlen(new_req),sizeof(new_req),"\r\n");
-            printf("%s",new_req);
-            printf("Forwarding Request\n");
-
-            if(send(serverfd,new_req,strlen(new_req),MSG_NOSIGNAL) == -1) {
-                perror("Upstream send failed");
-                send_error_response(newfd, 503, "Service Unavailable",NULL);
-                snprintf(log_buf, sizeof(log_buf), "Failed to send headers to: %s", req.hostname);
-                log_event(LEVEL_ERROR, req_id, client_ip, log_buf);
-                close(serverfd);
-                break;
-            }
-            
-            fetch_and_cache(newfd,serverfd,url,client_ip,cache_file,req_id);
-            close(serverfd);
-        } else if(strncmp(method,"POST",4) == 0) {
-            printf("[Proxy] Tunneling POST Request\n");
-            handle_tunnel_request(newfd, &req, buffer, bytes_received,method,url,protocol,client_ip,req_id);
-            keep_alive = 0;
-        } else {
-            send_error_response(newfd,501,"Not Implemented",NULL);
-            log_event(LEVEL_WARN, req_id, client_ip, "Unsupported Method");
-            keep_alive = 0;
-        }
-    }
-
-    close(newfd);
-    return NULL;
-}
 int main() {
     struct sockaddr_storage their_addr;
     struct addrinfo hints, *res, *p;
@@ -338,7 +552,7 @@ int main() {
     
     signal(SIGPIPE, SIG_IGN); 
     mkdir("cache", 0777);
-    init_log(LEVEL_DEBUG);
+    init_log(LEVEL_ERROR);
     init_rate_limiter();
     memset(&hints,0,sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -380,28 +594,54 @@ int main() {
     printf("Server is listening\n");
     global_req_id = (uint64_t)time(NULL) << 16;
     printf("Proxy Server started. Initial Req ID: %" PRIu64 "\n", global_req_id);
+    make_socket_non_blocking(sockfd); // Make the main listener non-blocking
+    
+    epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        perror("epoll_create1 failed");
+        exit(1);
+    }
+
+    struct epoll_event event;
+    struct epoll_event events[MAX_FDS];
+
+    event.data.fd = sockfd;
+    event.events = EPOLLIN;
+    
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sockfd, &event) == -1) {
+        perror("epoll_ctl: sockfd");
+        exit(1);
+    }
+
     init_thread_pool(100,4096);
     while(1) {
-        sin_size = sizeof their_addr;
-        newfd = accept(sockfd,(struct sockaddr*)&their_addr,&sin_size);
-        if(newfd == -1) {
-            perror("accept");
-            continue;
-        }
-        thread_args_t *args = malloc(sizeof(thread_args_t));
-        if(!args) {
-            perror("malloc");
-            close(newfd);
-            continue;
-        }
 
-        args->client_fd = newfd;
-        if(submit_task(handle_client,(void*) args) == -1) {
-            printf("[System] Proxy overloaded. Dropping connection.\n");
-            send_error_response(newfd, 503, "Service Unavailable: Server Overloaded","Retry: 5\r\n");
-            close(newfd);
-            free(args);
-        }
-    }
+        int n_ready = epoll_wait(epoll_fd,events,MAX_FDS,-1);
+        for(int i = 0;i < n_ready;i++) {
+            int currentfd = events[i].data.fd;
+            if(currentfd == sockfd) {
+                while(1) {
+                    sin_size = sizeof their_addr;
+                    newfd = accept(sockfd,(struct sockaddr*)&their_addr,&sin_size);
+                    if(newfd == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break; // We accepted all incoming connections
+                        }
+                        perror("accept");
+                        continue;
+                    }
+                    make_socket_non_blocking(newfd);
+
+                    ConnectionContext* ctx = create_context(newfd);
+                    event.data.fd = newfd;
+                    event.events = EPOLLIN | EPOLLONESHOT;
+                    epoll_ctl(epoll_fd,EPOLL_CTL_ADD,newfd,&event);
+                }
+            } else {
+                ConnectionContext* ctx = context_table[currentfd];
+                submit_task(handle_state_machine,(void*)ctx);
+            }
+        }   
+    } 
     return 0;
 }

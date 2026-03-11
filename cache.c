@@ -3,18 +3,26 @@
 #include<sys/stat.h>
 #include<string.h>
 #include<time.h>
-#include<utime.h>
+#include<sys/time.h>
 #include<dirent.h>
 #include<sys/socket.h>
 #include<pthread.h>
 #include<stdint.h>
+#include<sys/sendfile.h>
+#include<sys/types.h>
+#include<unistd.h>
+#include<errno.h>
+#include<fcntl.h>
 #include"cache.h"
-#include"proxy_log.h"
-#include"errors.h"
 
 #define MAX_CACHE_SIZE 10*1024*1024 
+#define DEFAULT_TTL 300
 #define BUFFER 8192
 
+extern int epoll_fd;
+extern ConnectionContext* context_table[];
+extern void handle_connect_upstream(ConnectionContext* ctx);
+extern void handle_send_response_headers(ConnectionContext* ctx);
 static pthread_mutex_t eviction_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
@@ -26,6 +34,7 @@ typedef struct {
 typedef struct {
     time_t expires_at;
     long content_length;
+    int upstream_header_len;
     char url[5120];
     char padding[256];
 }CacheHeader;
@@ -47,16 +56,16 @@ void get_cache_filename(char* url,char* buffer) {
 }
 
 void mark_as_used(char* filename) {
-    utime(filename,NULL);
+    utimes(filename,NULL);
 }
 
 int parse_cache_policy(char* response_buffer) {
-    int ttl = 300;// Default TTL
+    int ttl = DEFAULT_TTL;// Default TTL
     char* cc_header = strstr(response_buffer,"Cache-Control:");
     if(!cc_header) return ttl;
     cc_header += 15;
     if(strncmp(cc_header,"no-store",8) == 0 || strncmp(cc_header,"no-cache",8) == 0 || strncmp(cc_header,"private",7) == 0) {
-        return - 1; // Don't cache
+        return 0; // Don't cache
     }
 
     if(strncmp(cc_header,"max-age=",8) == 0) {
@@ -65,12 +74,11 @@ int parse_cache_policy(char* response_buffer) {
     return ttl;
 }
 
-void filter_and_send_headers(int client_fd,char* header_block,int block_len) {
+int filter_headers_to_buffer(int client_fd,char* header_block,int block_len,char* headers,int offset) {
+    if (block_len < 0 || block_len >= BUFFER) return 0;
     char* save_ptr;
     char* headers_copy = malloc(block_len + 1);
-    char end_to_end_headers[block_len + 1];
-    end_to_end_headers[block_len] = '\0';
-    if(!headers_copy) return;
+    if(!headers_copy) return 0;
     memcpy(headers_copy,header_block,block_len);
     headers_copy[block_len] = '\0';
 
@@ -79,49 +87,88 @@ void filter_and_send_headers(int client_fd,char* header_block,int block_len) {
         line = strtok_r(NULL,"\r\n",&save_ptr);
     }
     while(line != NULL) {
-        if(strncmp(line,"Connection:",11) == 0 || strncmp(line,"Keep-Alive:", 11) == 0 || strncmp(line,"Transfer-Encoding:", 18) == 0 || strncmp(line,"Upgrade:", 8) == 0 || strncmp(line,"Content-Length:",15) == 0) {
+        if(strncmp(line,"Connection:",11) == 0 || strncmp(line,"Keep-Alive:", 11) == 0 || strncmp(line,"Transfer-Encoding:", 18) == 0 || strncmp(line,"Upgrade:", 8) == 0 || strncmp(line,"Content-Length:",15) == 0 || strncmp(line,"Proxy-Connection:",17) == 0) {
             line = strtok_r(NULL,"\r\n",&save_ptr);
             continue;
         }
-        snprintf(end_to_end_headers + strlen(end_to_end_headers),sizeof(end_to_end_headers),"%s\r\n",line);
+        offset += snprintf(headers + strlen(headers),BUFFER - offset,"%s\r\n",line);
         line = strtok_r(NULL,"\r\n",&save_ptr);
     }
-    snprintf(end_to_end_headers + strlen(end_to_end_headers),sizeof(end_to_end_headers),"\r\n");
-    send(client_fd,end_to_end_headers,strlen(end_to_end_headers),MSG_NOSIGNAL);
+    offset += snprintf(headers + strlen(headers),BUFFER - offset,"\r\n");
+    free(headers_copy);
+    return offset;
 }
 
-int check_cache(char* filename,char* url) {
-    FILE* fp = fopen(filename,"rb");
-    if(!fp) return 0;
-    
+int check_cache(ConnectionContext* ctx) {
+    char cache_file[256];
+    get_cache_filename(ctx->url,cache_file);
+
+    ctx->file_fd = open(cache_file,O_RDONLY);
+    if(ctx->file_fd < 0) {
+        //CACHE MISS
+        return 0;
+    }
     CacheHeader header;
-    if(fread(&header,sizeof(CacheHeader),1,fp) != 1) {
-        fclose(fp); // Invalid File
+    if (read(ctx->file_fd,&header,sizeof(CacheHeader))  != sizeof(CacheHeader)) {
+        close(ctx->file_fd);
+        unlink(cache_file);
+        ctx->file_fd = -1;
         return 0;
     }
-    time_t now = time(NULL);
-    if(now > header.expires_at) {
-        printf("Cache Expired!Fetching a new copy....\n");
-        return 0;
-    }
-
-    if(strcmp(url,header.url) != 0) {
-        printf("URL Expected: %s GOT: %s\n",url,header.url);
-        fclose(fp);
-        return 0;
-    }
-
-    fseek(fp,0,SEEK_END);
-    long actual_size = ftell(fp);
+    
+    struct stat st;
+    fstat(ctx->file_fd,&st);
     long expected_size = sizeof(CacheHeader) + header.content_length;
+    time_t now = time(NULL);
 
-    if(actual_size < expected_size) {
-        fclose(fp);
+    if(now > header.expires_at || strcmp(ctx->url,header.url) != 0 || st.st_size < expected_size) {
+        //CACHE MISS
+        close(ctx->file_fd);
+        unlink(cache_file);
+        ctx->file_fd = -1;
         return 0;
     }
-    fclose(fp);
-    mark_as_used(filename);
+    
+    ctx->upstream_content_length = header.content_length;
+    ctx->upstream_header_len = header.upstream_header_len;
+    mark_as_used(cache_file);
     return 1;
+}
+
+void handle_check_cache(ConnectionContext* ctx) {
+    
+    if(ctx->checkCache) {
+        if(!check_cache(ctx)) {
+            //CACHE MISS
+            ctx->state = STATE_CONNECT_UPSTREAM;
+            handle_connect_upstream(ctx);
+            return;
+        }
+    }
+
+    //CACHE HIT
+    char file_buffer[BUFFER];
+    int bytes_read = read(ctx->file_fd,file_buffer,sizeof(file_buffer));
+    ctx->write_len = 0;
+    ctx->write_offset = 0;
+    ctx->bytes_remaining = ctx->upstream_content_length - ctx->upstream_header_len;
+    ctx->write_len += snprintf(ctx->write_buf, sizeof(ctx->write_buf),
+            "HTTP/1.1 200 OK\r\n"
+            "Connection: keep-alive\r\n"
+            "Content-Length: %ld\r\n",
+            ctx->bytes_remaining);
+
+    if(ctx->checkCache) {
+        ctx->write_len += snprintf(ctx->write_buf + ctx->write_len,sizeof(ctx->write_buf) - ctx->write_len,
+                          "X-Cache: HIT\r\n");
+    }
+
+    ctx->write_len += filter_headers_to_buffer(ctx->client_fd,file_buffer,ctx->upstream_header_len,ctx->write_buf,ctx->write_len);
+    long body_offset = sizeof(CacheHeader) + ctx->upstream_header_len;
+    lseek(ctx->file_fd,body_offset,SEEK_SET);
+    ctx->state = STATE_SEND_RESPONSE_HEADERS;
+    handle_send_response_headers(ctx);
+    return;
 }
 
 int compare_cache_entries(const void* a,const void* b) {
@@ -193,160 +240,159 @@ void enforce_cache_capacity() {
     pthread_mutex_unlock(&eviction_lock);
 }
 
-void serve_from_cache(int client_fd,char* url,char* client_ip,char* cache_file,uint64_t req_id) {
-    FILE *fp = fopen(cache_file,"rb");
-
-    if (!fp) {
-        send_error_response(client_fd, 500, "Internal Cache Error",NULL);
-        log_event(LEVEL_ERROR, req_id, client_ip, "Cache Hit but failed to open file");
-        return;
-    }
-    
-    log_event(LEVEL_DEBUG, req_id, client_ip, "Streaming from cache...");
-    CacheHeader header;
-    if (fread(&header, sizeof(CacheHeader), 1, fp) != 1) {
-        fclose(fp);
-        return;
-    }
-    char file_buffer[BUFFER];
-    int bytes_read = fread(file_buffer,1,sizeof(file_buffer),fp);
-    char* body_ptr = strstr(file_buffer,"\r\n\r\n");
-    if(body_ptr) {
-        body_ptr += 4;
-        char initial_headers[256];
-        long content_length = header.content_length - (body_ptr - file_buffer);
-        snprintf(initial_headers, sizeof(initial_headers),
-                "HTTP/1.1 200 OK\r\n"
-                "Connection: keep-alive\r\n"
-                "Content-Length: %ld\r\n",
-                content_length);
-        send(client_fd, initial_headers, strlen(initial_headers), MSG_NOSIGNAL);
-        
-        filter_and_send_headers(client_fd,file_buffer,body_ptr - file_buffer);
-
-        int body_in_buffer = bytes_read - (body_ptr - file_buffer);
-        send(client_fd,body_ptr,body_in_buffer,MSG_NOSIGNAL);
-    }
-    long total_sent = bytes_read;
-    int success = 1;
-    while((bytes_read = fread(file_buffer,1,sizeof(file_buffer),fp)) > 0) {
-        if(send(client_fd, file_buffer, bytes_read, MSG_NOSIGNAL) == -1) {
-            log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during cache stream");
-            success = 0;
-            break;
+void handle_send_cache(ConnectionContext *ctx) {
+    while(ctx->bytes_remaining > 0) {
+        ssize_t bytes_sent = sendfile(ctx->client_fd, ctx->file_fd, NULL , ctx->bytes_remaining);
+        if (bytes_sent < 0) {
+            if(errno == EWOULDBLOCK || errno == EAGAIN) {
+                return;
+            }
+            perror("sendfile failed");
+            ctx->state = STATE_CLOSE;
+            return;
+        } else if(bytes_sent == 0) {
+            ctx->state = STATE_CLOSE;
+            return;
         }
-        total_sent += bytes_read;
+        ctx->bytes_remaining -= bytes_sent;
     }
-    fclose(fp);
-    char log_msg[128];
-    if (success) {
-       snprintf(log_msg, sizeof(log_msg), "Cache HIT served: %ld bytes", total_sent);
-       log_event(LEVEL_INFO, req_id, client_ip, log_msg); 
+    close(ctx->file_fd);
+    ctx->file_fd = -1;
+    if(ctx->keep_alive) {
+        ctx->bytes_read = 0;
+        memset(ctx->read_buf,0,sizeof(ctx->read_buf));
+        ctx->state = STATE_READ_REQUEST;
     } else {
-       log_event(LEVEL_WARN, req_id, client_ip, "Client Closed Request");
+        ctx->state = STATE_CLOSE;
     }
 }
 
-void fetch_and_cache(int client_fd,int serverfd,char* url,char* client_ip,char* cache_file,uint64_t req_id) {
+void handle_fetch_upstream(ConnectionContext* ctx) {
+    if(ctx->file_fd == -1) {
+        char cache_file[256];
+        get_cache_filename(ctx->url,cache_file);
 
-    enforce_cache_capacity();
+        ctx->file_fd = open(cache_file,O_WRONLY | O_CREAT | O_TRUNC,0644);
+        if(ctx->file_fd == -1) {
+            perror("Failed to open Cache File");
+            send_error_response(ctx->client_fd, 500, "Internal Cache Error",NULL);
+            log_event(LEVEL_ERROR, ctx->req_id, ctx->client_ip, "Failed to open cache file");
+            ctx->state = STATE_CLOSE;
+            return;
+        }
 
-    char temp_file[512];
-    snprintf(temp_file,sizeof(temp_file),"%s.%ld.tmp",cache_file,pthread_self());
+        ctx->upstream_headers_parsed = 0;
+        ctx->cache_ttl = DEFAULT_TTL;
+        ctx->upstream_header_len = 0;
+        ctx->upstream_content_length = 0;
+        ctx->upstream_body_downloaded = 0;
 
-    FILE *cache_fp = fopen(temp_file,"wb");
-    if(!cache_fp) {
-        log_event(LEVEL_WARN, req_id, client_ip, "Failed to create temp cache file (Disk full?)");
+        CacheHeader dummyHeader;
+        memset(&dummyHeader,0,sizeof(dummyHeader));
+        if(write(ctx->file_fd,&dummyHeader,sizeof(dummyHeader)) < 0) {
+            ctx->state = STATE_CLOSE;
+            return;
+        }
     }
-    log_event(LEVEL_DEBUG, req_id, client_ip, "Downloading from upstream...");
 
-    char remote_buffer[BUFFER];
-    int n,completed = 0,has_sent_headers = 0,is_cacheable = 1,first_chunk = 1;
-    long total_bytes = 0;
-    CacheHeader header;
-    memset(&header,0,sizeof(CacheHeader));
-    strncpy(header.url,url,sizeof(header.url) - 1);
-    header.url[sizeof(header.url) - 1] = '\0';
-    while((n =  recv(serverfd,remote_buffer,BUFFER - 1,0)) > 0) {
-        remote_buffer[n] = '\0';
-        int client_connected = 1;
-        int ttl;
-        int send_bytes = 0;
-        if(first_chunk) {
-            ttl = parse_cache_policy(remote_buffer);
-            if(ttl < 0) {
-                is_cacheable = 0;
-                log_event(LEVEL_INFO, req_id, client_ip, "Policy: DO NOT CACHE");
-            } else {
-                is_cacheable = 1;
-                header.expires_at = time(NULL) + ttl;
-                if(fwrite(&header,sizeof(CacheHeader),1,cache_fp) != 1) {
-                    is_cacheable = 0;
+    while(1) {
+        if(!ctx->upstream_headers_parsed) {
+            int n = recv(ctx->upstream_fd,ctx->upstream_header_buf + ctx->upstream_header_len,BUFFER - 1 - ctx->upstream_header_len,MSG_NOSIGNAL);
+
+            if(n < 0) {
+                if(errno == EWOULDBLOCK || errno == EAGAIN) return;
+                ctx->state = STATE_CLOSE;
+                return;
+            }
+            ctx->upstream_header_len += n;
+            ctx->upstream_header_buf[ctx->upstream_header_len] = '\0';
+            char* body_ptr = strstr(ctx->upstream_header_buf,"\r\n\r\n");
+            if(body_ptr != NULL) {
+                body_ptr += 4;
+                char* cc_length = strstr(ctx->upstream_header_buf,"Content-Length:");
+                if(cc_length) ctx->upstream_content_length = atoi(cc_length + 15);
+        
+                ctx->cache_ttl = parse_cache_policy(ctx->upstream_header_buf);
+
+                int headers_len = body_ptr - ctx->upstream_header_buf;
+                int body_in_buf = ctx->upstream_header_len - headers_len;
+
+                ctx->upstream_body_downloaded += body_in_buf;
+                write(ctx->file_fd,ctx->upstream_header_buf,ctx->upstream_header_len);
+                ctx->upstream_header_len = headers_len;
+                ctx->upstream_headers_parsed = 1;
+
+                if(ctx->upstream_content_length > 0 && ctx->upstream_body_downloaded >= ctx->upstream_content_length) {
+                    break;
                 }
             }
-            first_chunk = 0;
-        }
-        int byt = 0;
-        while(send_bytes < n) {
-            if((byt = send(client_fd, remote_buffer + send_bytes, n - send_bytes, MSG_NOSIGNAL)) == -1) {
-                client_connected = 0;
-                log_event(LEVEL_WARN, req_id, client_ip, "Client disconnected during download");
+
+            if(n == 0) break;
+        } else {
+            
+            char temp_buf[BUFFER];
+            int n = recv(ctx->upstream_fd, temp_buf,BUFFER - 1,MSG_NOSIGNAL);
+            
+            if(n < 0) {
+                if(errno == EWOULDBLOCK || errno == EAGAIN) return;
+                ctx->state = STATE_CLOSE;
+                return;
+            } else if(n == 0) {
                 break;
             }
-            send_bytes += byt;
-        }
-        if(!client_connected) {
-            is_cacheable = 0;
-            break;
-        }
-        has_sent_headers = 1;
-        
-        if(cache_fp && is_cacheable) {
-            if(fwrite(remote_buffer, 1, n, cache_fp) != n) {
-                log_event(LEVEL_ERROR, req_id, client_ip, "Cache write error");
-                fclose(cache_fp);
-                cache_fp = NULL;
-                remove(temp_file);
-            }
-        }
-        total_bytes += n;
-    }
-    if (n == 0) {
-        completed = 1;
-    } else if (n < 0) {
-        log_event(LEVEL_ERROR, req_id, client_ip, "Upstream recv error");
-        if (!has_sent_headers) {
-            send_error_response(client_fd, 502, "Bad Gateway: Upstream Error",NULL);
-        }
-    }
 
-    if(cache_fp) {
-        if(is_cacheable && completed && total_bytes > 0) {
-            header.content_length = total_bytes;
-            fseek(cache_fp,0,SEEK_SET);
-            if(fwrite(&header,sizeof(CacheHeader),1,cache_fp) != 1) {
-                is_cacheable = 0;
+            if(write(ctx->file_fd,temp_buf,n) < 0) {
+                perror("Disk Write Error");
+                ctx->state = STATE_CLOSE;
+                return;
             }
-            fclose(cache_fp);
-            if(is_cacheable && rename(temp_file, cache_file) == 0) {
-                log_event(LEVEL_DEBUG, req_id, client_ip, "Cache commit successful");
-            } else {
-               log_event(LEVEL_ERROR, req_id, client_ip, "Cache commit failed (rename)");
-                remove(temp_file);
+            ctx->upstream_body_downloaded += n;
+            if(ctx->upstream_content_length > 0 && ctx->upstream_body_downloaded >= ctx->upstream_content_length) {
+                break;
             }
-        } else {
-            fclose(cache_fp);
-            remove(temp_file);
         }
+    }
+    close(ctx->upstream_fd);
+    context_table[ctx->upstream_fd] = NULL;
+    ctx->upstream_fd = -1;
+
+    
+    CacheHeader finalHeader;
+    memset(&finalHeader,0,sizeof(finalHeader));
+    strncpy(finalHeader.url,ctx->url,sizeof(finalHeader.url) - 1);
+    finalHeader.expires_at = time(NULL) + ctx->cache_ttl;
+    
+    struct stat st;
+    fstat(ctx->file_fd,&st);
+    finalHeader.content_length = st.st_size - sizeof(CacheHeader);
+    ctx->bytes_remaining = finalHeader.content_length - ctx->upstream_header_len;
+    finalHeader.upstream_header_len = ctx->upstream_header_len;
+    lseek(ctx->file_fd,0,SEEK_SET);
+    write(ctx->file_fd,&finalHeader,sizeof(finalHeader));
+
+    close(ctx->file_fd);
+    ctx->file_fd = -1;
+
+    if(ctx->cache_ttl <= 0) {
+        char cache_file[256];
+        get_cache_filename(ctx->url,cache_file);
+        unlink(cache_file);
+    } else {
+        enforce_cache_capacity();
     }
     
-    char log_msg[128];
-    if (completed) {
-        snprintf(log_msg, sizeof(log_msg), "Cache MISS served: %ld bytes", total_bytes);
-        log_event(LEVEL_INFO, req_id, client_ip, log_msg);
-    } else {
-        snprintf(log_msg, sizeof(log_msg), "Transaction Failed. Relayed: %ld bytes", total_bytes);
-        log_event(LEVEL_WARN, req_id, client_ip, log_msg);
+    char cache_file[256];
+    get_cache_filename(ctx->url,cache_file);
+    ctx->file_fd = open(cache_file,O_RDONLY);
+
+    if(ctx->file_fd < 0) {
+        ctx->state = STATE_CLOSE;
+        return;
     }
+    lseek(ctx->file_fd, sizeof(CacheHeader), SEEK_SET);
+    ctx->checkCache = 0;
+    ctx->state = STATE_CHECK_CACHE;
+    handle_check_cache(ctx);
+    return;
 }
 
