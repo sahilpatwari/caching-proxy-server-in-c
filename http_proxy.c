@@ -5,12 +5,10 @@
 #include<arpa/inet.h>
 #include<netdb.h>
 #include<netinet/in.h>
-#include<pthread.h>
 #include<unistd.h>
 #include<sys/stat.h>
 #include<string.h>
 #include<signal.h>
-#include <stdatomic.h>
 #include <time.h>
 #include <stdint.h> 
 #include <inttypes.h>
@@ -20,6 +18,7 @@
 #include<fcntl.h>
 #include<sys/epoll.h>
 
+
 #include"cache.h"
 #include"rate_limiter.h"
 #include"thread_pool.h"
@@ -28,11 +27,103 @@
 #define BACKLOG SOMAXCONN
 #define BUFFER 8192
 #define MAX_FDS 10000 
+#define POOL_BUCKETS 1024
 
 // ATOMIC REQUEST ID COUNTER
 static _Atomic uint64_t global_req_id = 0;
 //EPOLL INSTANCE
 int epoll_fd;
+HostBucket connection_map[POOL_BUCKETS];
+void handle_connect_upstream(ConnectionContext* ctx);
+static unsigned long hash_host(const char* hostname,int port) {
+    unsigned long hash = 5381;
+    int c;
+    while((c = *hostname++)) {
+        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+    }
+    hash = ((hash << 5) + hash) + port;
+    return hash % POOL_BUCKETS;
+}
+
+void init_connection_pool() {
+    for (int i = 0; i < POOL_BUCKETS; i++) {
+        pthread_mutex_init(&connection_map[i].bucket_lock, NULL);
+        connection_map[i].head = NULL;
+    }
+}
+
+int get_pool_connection(char* hostname,int port) {
+    int idx = hash_host(hostname,port);
+    HostBucket* bucket = &connection_map[idx];
+    
+    int pool_fd = -1;
+    pthread_mutex_lock(&bucket->bucket_lock);
+
+    HostEntry* curr_host = bucket->head;
+    while(curr_host != NULL) {
+        if(strcmp(curr_host->hostname,hostname) == 0 && curr_host->port == port) {
+            if(curr_host->fd_head != NULL) {
+                 ConnectionNode* node = curr_host->fd_head;
+                 pool_fd = node->fd;
+
+                 curr_host->fd_head = node->next;
+                 free(node);
+            }
+            break;
+        }
+        curr_host = curr_host->next_host;
+    }
+    pthread_mutex_unlock(&bucket->bucket_lock);
+    return pool_fd;
+}
+
+void stash_connection(int fd, char* hostname, int port) {
+    int idx = hash_host(hostname,port);
+    HostBucket* bucket = &connection_map[idx];
+
+    pthread_mutex_lock(&bucket->bucket_lock);
+
+    HostEntry* curr_host = bucket->head;
+    HostEntry* target_host = NULL;
+    while(curr_host != NULL) {
+        if(strcmp(curr_host->hostname,hostname) == 0 && curr_host->port == port) {
+            target_host = curr_host;
+            break;
+        }
+        curr_host = curr_host->next_host;
+    }
+
+    if(target_host == NULL) {
+        target_host = malloc(sizeof(HostEntry));
+        if(!target_host) {
+            perror("malloc");
+            close(fd);
+            pthread_mutex_unlock(&bucket->bucket_lock);
+            return;
+        }
+
+        strncpy(target_host->hostname,hostname,sizeof(target_host->hostname) - 1);
+        target_host->port = port;
+        target_host->fd_head = NULL;
+        target_host->next_host = bucket->head;
+        bucket->head = target_host;
+    }
+
+    ConnectionNode* node = malloc(sizeof(ConnectionNode));
+    if(!node) {
+        perror("malloc");
+        close(fd);
+        pthread_mutex_unlock(&bucket->bucket_lock);
+        return;
+    }
+
+    node->fd = fd;
+    node->next = target_host->fd_head;
+    target_host->fd_head = node;
+
+    pthread_mutex_unlock(&bucket->bucket_lock);
+    return;
+}
 
 ConnectionContext* context_table[MAX_FDS];
 ConnectionContext* create_context(int fd) {
@@ -53,6 +144,8 @@ ConnectionContext* create_context(int fd) {
     ctx->upstream_fd = -1;
     ctx->file_fd = -1;
     // GENERATE ID
+    ctx->active_threads = 0;
+    pthread_mutex_init(&ctx->state_lock, NULL);
     ctx->req_id = global_req_id++;
     ctx->state = STATE_READ_REQUEST;
     ctx->bytes_read = 0;
@@ -124,28 +217,37 @@ void handle_send_response_headers(ConnectionContext* ctx) {
 
     handle_send_cache(ctx);
 }
+
 void handle_send_upstream(ConnectionContext* ctx) {
     
     if(ctx->write_len == 0) {
         ctx->write_len = snprintf(ctx->write_buf,sizeof(ctx->write_buf),
-        "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n"
-        ,ctx->method,(ctx->req).path,(ctx->req).hostname);
+        "%s %s %s\r\nHost: %s\r\nConnection: keep-alive\r\n"
+        ,ctx->method,(ctx->req).path,ctx->protocol,(ctx->req).hostname);
 
         ctx->write_offset = 0;
         char *buffer_ptr;
         char* headers_copy = malloc(BUFFER + 1);
-        headers_copy[BUFFER] ='\0';
-        strncpy(headers_copy,ctx->read_buf,BUFFER);
+        char* end_of_headers = strstr(ctx->read_buf,"\r\n\r\n");
+        if(end_of_headers) {
+            int header_len = end_of_headers - ctx->read_buf;
+            memcpy(headers_copy,ctx->read_buf,header_len);
+            headers_copy[header_len] = '\0';
+        } else {
+            strncpy(headers_copy,ctx->read_buf,BUFFER);
+            headers_copy[BUFFER] ='\0';
+        }
+
         char *token = strtok_r(headers_copy,"\r\n",&buffer_ptr);
         while(token != NULL) {
             if(strncmp(token,ctx->method,strlen(ctx->method)) == 0 || strncmp(token,"Host",4) == 0 || strncmp(token,"Connection",10) == 0) {
                 token = strtok_r(NULL,"\r\n",&buffer_ptr);
                 continue;
             }
-            ctx->write_len += snprintf(ctx->write_buf + strlen(ctx->write_buf),sizeof(ctx->write_buf),"%s\r\n",token);
+            ctx->write_len += snprintf(ctx->write_buf + ctx->write_len,sizeof(ctx->write_buf) - ctx->write_len,"%s\r\n",token);
             token = strtok_r(NULL,"\r\n",&buffer_ptr);
         }
-        ctx->write_len += snprintf(ctx->write_buf + strlen(ctx->write_buf),sizeof(ctx->write_buf),"\r\n");
+        ctx->write_len += snprintf(ctx->write_buf + ctx->write_len,sizeof(ctx->write_buf) - ctx->write_len,"\r\n");
         free(headers_copy);
     }
 
@@ -154,6 +256,16 @@ void handle_send_upstream(ConnectionContext* ctx) {
 
         if(bytes_sent < 0) {
             if(errno == EWOULDBLOCK || errno == EAGAIN) {
+                return;
+            }
+            if(errno == EPIPE || errno == ECONNRESET) {
+                epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->upstream_fd,NULL);
+                context_table[ctx->upstream_fd] = NULL;
+                close(ctx->upstream_fd);
+                ctx->upstream_fd = -1;
+
+                ctx->state = STATE_CONNECT_UPSTREAM;
+                handle_connect_upstream(ctx);
                 return;
             }
             perror("upstream send error");
@@ -171,6 +283,27 @@ void handle_send_upstream(ConnectionContext* ctx) {
 }
 
 void handle_connect_upstream(ConnectionContext* ctx) {
+
+    int warmfd = get_pool_connection((ctx->req).hostname,(ctx->req).port);
+    if(warmfd != -1) {
+        ctx->upstream_fd = warmfd;
+        context_table[warmfd] = ctx;
+
+        struct epoll_event event;
+        event.data.fd = warmfd;
+        event.events = EPOLLOUT | EPOLLONESHOT;
+
+        if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,warmfd,&event) == -1) {
+             perror("epoll_ctl add upstream");
+             ctx->state = STATE_CLOSE;
+             return;
+        }
+
+        ctx->state = STATE_SEND_UPSTREAM;
+        handle_send_upstream(ctx);
+        return;
+    }
+
     struct addrinfo hints, *res, *p;
     int sockfd,status,connect_res = -1;
 
@@ -233,6 +366,7 @@ void handle_connect_upstream(ConnectionContext* ctx) {
     }
     return;
 }
+
 
 void handle_wait_connect(ConnectionContext *ctx) {
     int error = 0;
@@ -334,43 +468,48 @@ void handle_read_request(ConnectionContext* ctx) {
 }
 void* handle_state_machine(void* args) {
     ConnectionContext* ctx = (ConnectionContext*)args;
-    
+
     if(ctx == NULL) return NULL;
-    switch(ctx->state) {
-        case STATE_READ_REQUEST:
-            handle_read_request(ctx);
-            break;
-        case STATE_PARSE_REQUEST:
-            handle_parse_request(ctx);
-            break;
-        case STATE_CHECK_CACHE:
-            handle_check_cache(ctx);
-            break;
-        case STATE_SEND_CACHE:
-            handle_send_cache(ctx);
-            break;
-        case STATE_CONNECT_UPSTREAM:
-            handle_connect_upstream(ctx);
-            break;
-        case STATE_WAIT_CONNECT:
-            handle_wait_connect(ctx);
-            break;
-        case STATE_SEND_UPSTREAM:
-            handle_send_upstream(ctx);
-            break;
-        case STATE_FETCH_UPSTREAM:
-            handle_fetch_upstream(ctx);
-            break;
-        case STATE_SEND_RESPONSE_HEADERS:
-            handle_send_response_headers(ctx);
-            break;
-        /*case STATE_TUNNELING:
-            handle_tunnel_request(ctx);
-            break;*/
-        case STATE_CLOSE:
-            free_context(ctx);
-            return NULL;  
+
+    atomic_fetch_add(&ctx->active_threads, 1);
+
+    pthread_mutex_lock(&ctx->state_lock);
+    if(ctx->state != STATE_CLOSE) {
+        switch(ctx->state) {
+            case STATE_READ_REQUEST:
+                handle_read_request(ctx);
+                break;
+            case STATE_PARSE_REQUEST:
+                handle_parse_request(ctx);
+                break;
+            case STATE_CHECK_CACHE:
+                handle_check_cache(ctx);
+                break;
+            case STATE_SEND_CACHE:
+                handle_send_cache(ctx);
+                break;
+            case STATE_CONNECT_UPSTREAM:
+                handle_connect_upstream(ctx);
+                break;
+            case STATE_WAIT_CONNECT:
+                handle_wait_connect(ctx);
+                break;
+            case STATE_SEND_UPSTREAM:
+                handle_send_upstream(ctx);
+                break;
+            case STATE_FETCH_UPSTREAM:
+                handle_fetch_upstream(ctx);
+                break;
+            case STATE_SEND_RESPONSE_HEADERS:
+                handle_send_response_headers(ctx);
+                break;
+            /*case STATE_TUNNELING:
+                handle_tunnel_request(ctx);
+                break;*/ 
+        }
     }
+    
+    pthread_mutex_unlock(&ctx->state_lock);
 
     if(ctx->state != STATE_CLOSE) {
         struct epoll_event event;
@@ -400,7 +539,12 @@ void* handle_state_machine(void* args) {
                 free_context(ctx);
             }
         }
-    } else {
+    }
+
+    int remaining_threads = atomic_fetch_sub(&ctx->active_threads, 1) - 1;
+
+    if(ctx->state == STATE_CLOSE && remaining_threads == 0) {
+        pthread_mutex_destroy(&ctx->state_lock);
         free_context(ctx);
     }
     return NULL;
@@ -554,6 +698,7 @@ int main() {
     mkdir("cache", 0777);
     init_log(LEVEL_ERROR);
     init_rate_limiter();
+    init_connection_pool();
     memset(&hints,0,sizeof hints);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;

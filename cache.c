@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include<stdio.h>
 #include<stdlib.h>
 #include<sys/stat.h>
@@ -6,13 +8,13 @@
 #include<sys/time.h>
 #include<dirent.h>
 #include<sys/socket.h>
-#include<pthread.h>
 #include<stdint.h>
 #include<sys/sendfile.h>
 #include<sys/types.h>
 #include<unistd.h>
 #include<errno.h>
 #include<fcntl.h>
+#include<sys/epoll.h>
 #include"cache.h"
 
 #define MAX_CACHE_SIZE 10*1024*1024 
@@ -23,6 +25,7 @@ extern int epoll_fd;
 extern ConnectionContext* context_table[];
 extern void handle_connect_upstream(ConnectionContext* ctx);
 extern void handle_send_response_headers(ConnectionContext* ctx);
+extern void stash_connection(int fd,char* hostname,int port);
 static pthread_mutex_t eviction_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
@@ -61,14 +64,32 @@ void mark_as_used(char* filename) {
 
 int parse_cache_policy(char* response_buffer) {
     int ttl = DEFAULT_TTL;// Default TTL
-    char* cc_header = strstr(response_buffer,"Cache-Control:");
+    
+    int status_code = 0;
+    if(sscanf(response_buffer,"%*s %d",&status_code) == 1) {
+        if(status_code != 200) {
+            return 0;
+        }
+    }
+    
+    char* cc_header = strcasestr(response_buffer,"Cache-Control:");
     if(!cc_header) return ttl;
-    cc_header += 15;
-    if(strncmp(cc_header,"no-store",8) == 0 || strncmp(cc_header,"no-cache",8) == 0 || strncmp(cc_header,"private",7) == 0) {
+
+    cc_header = strchr(cc_header,':');
+    if(!cc_header) return ttl;
+
+    cc_header++;
+
+    char* end_of_line = strstr(cc_header,"\r\n");
+    int line_len = end_of_line ? (end_of_line - cc_header) : strlen(cc_header);
+
+    char header_val[256];
+    snprintf(header_val,sizeof(header_val),"%.*s",(line_len < sizeof(header_val) - 1) ? line_len : (int)(sizeof(header_val)) - 1,cc_header);
+    if(strcasestr(header_val,"no-store")  || strcasestr(header_val,"no-cache")  || strcasestr(header_val,"private")) {
         return 0; // Don't cache
     }
-
-    if(strncmp(cc_header,"max-age=",8) == 0) {
+    char* max_age = strcasestr(header_val,"max-age");
+    if(max_age) {
         ttl = atoi(cc_header + 8);
     }
     return ttl;
@@ -163,7 +184,7 @@ void handle_check_cache(ConnectionContext* ctx) {
                           "X-Cache: HIT\r\n");
     }
 
-    ctx->write_len += filter_headers_to_buffer(ctx->client_fd,file_buffer,ctx->upstream_header_len,ctx->write_buf,ctx->write_len);
+    ctx->write_len = filter_headers_to_buffer(ctx->client_fd,file_buffer,ctx->upstream_header_len,ctx->write_buf,ctx->write_len);
     long body_offset = sizeof(CacheHeader) + ctx->upstream_header_len;
     lseek(ctx->file_fd,body_offset,SEEK_SET);
     ctx->state = STATE_SEND_RESPONSE_HEADERS;
@@ -261,6 +282,24 @@ void handle_send_cache(ConnectionContext *ctx) {
     if(ctx->keep_alive) {
         ctx->bytes_read = 0;
         memset(ctx->read_buf,0,sizeof(ctx->read_buf));
+
+        ctx->write_len = 0;
+        ctx->write_offset = 0;
+        ctx->bytes_remaining = 0;
+
+        ctx->upstream_header_len = 0;
+        ctx->upstream_headers_parsed = 0;
+        ctx->upstream_content_length = 0;
+        ctx->upstream_body_downloaded = 0;
+        ctx->is_chunked = 0;
+        ctx->chunk_state = 0;
+        ctx->header_overshoot_len = 0;
+
+        ctx->checkCache = 0;
+        memset(&(ctx->req),0,sizeof(ctx->req));
+        memset(ctx->method,0,sizeof(ctx->method));
+        memset(ctx->url,0,sizeof(ctx->url));
+        memset(ctx->protocol,0,sizeof(ctx->protocol));
         ctx->state = STATE_READ_REQUEST;
     } else {
         ctx->state = STATE_CLOSE;
@@ -269,10 +308,12 @@ void handle_send_cache(ConnectionContext *ctx) {
 
 void handle_fetch_upstream(ConnectionContext* ctx) {
     if(ctx->file_fd == -1) {
-        char cache_file[256];
+        char cache_file[256],temp_file[300];
         get_cache_filename(ctx->url,cache_file);
+        
+        snprintf(temp_file, sizeof(temp_file), "%s.tmp.%d", cache_file, ctx->client_fd);
 
-        ctx->file_fd = open(cache_file,O_WRONLY | O_CREAT | O_TRUNC,0644);
+        ctx->file_fd = open(temp_file,O_WRONLY | O_CREAT | O_TRUNC,0644);
         if(ctx->file_fd == -1) {
             perror("Failed to open Cache File");
             send_error_response(ctx->client_fd, 500, "Internal Cache Error",NULL);
@@ -294,15 +335,24 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
             return;
         }
     }
-
+    int upstream_dropped = 0;
     while(1) {
         if(!ctx->upstream_headers_parsed) {
+
+            if(ctx->upstream_header_len >= BUFFER - 1) {
+                perror("Upstream Headers too large: exceeded limit");
+                ctx->state = STATE_CLOSE;
+                return;
+            }
+
             int n = recv(ctx->upstream_fd,ctx->upstream_header_buf + ctx->upstream_header_len,BUFFER - 1 - ctx->upstream_header_len,MSG_NOSIGNAL);
 
             if(n < 0) {
                 if(errno == EWOULDBLOCK || errno == EAGAIN) return;
                 ctx->state = STATE_CLOSE;
                 return;
+            } else if(n == 0) {
+                break;
             }
             ctx->upstream_header_len += n;
             ctx->upstream_header_buf[ctx->upstream_header_len] = '\0';
@@ -311,49 +361,124 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
                 body_ptr += 4;
                 char* cc_length = strstr(ctx->upstream_header_buf,"Content-Length:");
                 if(cc_length) ctx->upstream_content_length = atoi(cc_length + 15);
-        
+                
+                char* te_header = strstr(ctx->upstream_header_buf,"Transfer-Encoding:");
+                if(te_header && strstr(te_header,"chunked")) {
+                    ctx->is_chunked = 1;
+                    ctx->chunk_state = 0;
+                    ctx->current_chunk_bytes_read = 0;
+                    ctx->hex_idx = 0;
+                }
+
                 ctx->cache_ttl = parse_cache_policy(ctx->upstream_header_buf);
 
                 int headers_len = body_ptr - ctx->upstream_header_buf;
-                int body_in_buf = ctx->upstream_header_len - headers_len;
-
-                ctx->upstream_body_downloaded += body_in_buf;
-                write(ctx->file_fd,ctx->upstream_header_buf,ctx->upstream_header_len);
+                ctx->header_overshoot_len = ctx->upstream_header_len - headers_len;
+                
+                write(ctx->file_fd,ctx->upstream_header_buf,headers_len);
                 ctx->upstream_header_len = headers_len;
-                ctx->upstream_headers_parsed = 1;
 
+                if(ctx->header_overshoot_len > 0) {
+                    memcpy(ctx->header_overshoot_buf,body_ptr,ctx->header_overshoot_len);
+                }
+
+                ctx->upstream_headers_parsed = 1;
+                continue;
+            }
+        } else {
+            
+            char temp_buf[BUFFER];
+            int n; 
+            
+            if(ctx->header_overshoot_len > 0) {
+                memcpy(temp_buf,ctx->header_overshoot_buf,ctx->header_overshoot_len);
+                n = ctx->header_overshoot_len;
+                ctx->header_overshoot_len = 0;
+            } else {
+                n = recv(ctx->upstream_fd, temp_buf,BUFFER - 1,MSG_NOSIGNAL);
+
+                if(n < 0) {
+                    if(errno == EWOULDBLOCK || errno == EAGAIN) return;
+                    ctx->state = STATE_CLOSE;
+                    return;
+                } else if(n == 0) {
+                    upstream_dropped = 1;
+                    break;
+                }
+            }
+            
+            if(ctx->is_chunked) {
+                int i = 0;
+                while(i < n && ctx->chunk_state != 3) {
+                    if(ctx->chunk_state == 0) {
+                        char c = temp_buf[i++];
+                        if(c == '\r') continue;
+
+                        if(c == '\n') {
+                            ctx->hex_buf[ctx->hex_idx] = '\0';
+                            ctx->current_chunk_size = strtol(ctx->hex_buf,NULL,16);
+                            ctx->hex_idx = 0;
+
+                            if(ctx->current_chunk_size == 0) {
+                                ctx->chunk_state = 3;
+                            } else {
+                                ctx->chunk_state = 1;
+                                ctx->current_chunk_bytes_read = 0;
+                            }
+                        } else {
+                            if(ctx->hex_idx < 31) ctx->hex_buf[ctx->hex_idx++] = c;
+                        }   
+                    } else if(ctx->chunk_state == 1) {
+                        long to_read = ctx->current_chunk_size - ctx->current_chunk_bytes_read;
+                        long availiable = n - i;
+                        long write_len = (availiable < to_read) ? availiable : to_read;
+
+                        if(write(ctx->file_fd,temp_buf + i,write_len) != write_len) {
+                            perror("Disk Write Failure");
+                            ctx->state = STATE_CLOSE;
+                            return;
+                        }
+
+                        ctx->current_chunk_bytes_read += write_len;
+                        ctx->upstream_body_downloaded += write_len;
+                        i += write_len;
+                        if(ctx->current_chunk_bytes_read == ctx->current_chunk_size) {
+                            ctx->chunk_state = 2;
+                        }
+
+                    } else if(ctx->chunk_state == 2) {
+                        char c = temp_buf[i++];
+                        if(c == '\n') {
+                             ctx->chunk_state = 0;
+                        }
+                    }
+                }
+
+                if(ctx->chunk_state == 3) {
+                    break;
+                }
+            } else {
+                if(write(ctx->file_fd,temp_buf,n) < 0) {
+                    perror("Disk Write Error");
+                    ctx->state = STATE_CLOSE;
+                    return;
+                }
+                ctx->upstream_body_downloaded += n;
                 if(ctx->upstream_content_length > 0 && ctx->upstream_body_downloaded >= ctx->upstream_content_length) {
                     break;
                 }
             }
-
-            if(n == 0) break;
-        } else {
-            
-            char temp_buf[BUFFER];
-            int n = recv(ctx->upstream_fd, temp_buf,BUFFER - 1,MSG_NOSIGNAL);
-            
-            if(n < 0) {
-                if(errno == EWOULDBLOCK || errno == EAGAIN) return;
-                ctx->state = STATE_CLOSE;
-                return;
-            } else if(n == 0) {
-                break;
-            }
-
-            if(write(ctx->file_fd,temp_buf,n) < 0) {
-                perror("Disk Write Error");
-                ctx->state = STATE_CLOSE;
-                return;
-            }
-            ctx->upstream_body_downloaded += n;
-            if(ctx->upstream_content_length > 0 && ctx->upstream_body_downloaded >= ctx->upstream_content_length) {
-                break;
-            }
         }
     }
-    close(ctx->upstream_fd);
+    
+    epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->upstream_fd,NULL);
     context_table[ctx->upstream_fd] = NULL;
+
+    if(upstream_dropped) {
+        close(ctx->upstream_fd);
+    } else {
+        stash_connection(ctx->upstream_fd,(ctx->req).hostname,(ctx->req).port);
+    }
     ctx->upstream_fd = -1;
 
     
@@ -367,23 +492,28 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
     finalHeader.content_length = st.st_size - sizeof(CacheHeader);
     ctx->bytes_remaining = finalHeader.content_length - ctx->upstream_header_len;
     finalHeader.upstream_header_len = ctx->upstream_header_len;
+    ctx->upstream_content_length = finalHeader.content_length;
     lseek(ctx->file_fd,0,SEEK_SET);
     write(ctx->file_fd,&finalHeader,sizeof(finalHeader));
 
     close(ctx->file_fd);
     ctx->file_fd = -1;
+    
+    char cache_file[256],temp_file[300];
+    get_cache_filename(ctx->url,cache_file);
+    snprintf(temp_file, sizeof(temp_file), "%s.tmp.%d", cache_file, ctx->client_fd);
 
     if(ctx->cache_ttl <= 0) {
-        char cache_file[256];
-        get_cache_filename(ctx->url,cache_file);
-        unlink(cache_file);
+        ctx->file_fd = open(temp_file, O_RDONLY);
+
+        unlink(temp_file);
     } else {
+        rename(temp_file,cache_file);
         enforce_cache_capacity();
+
+        ctx->file_fd = open(cache_file,O_RDONLY);
     }
-    
-    char cache_file[256];
-    get_cache_filename(ctx->url,cache_file);
-    ctx->file_fd = open(cache_file,O_RDONLY);
+
 
     if(ctx->file_fd < 0) {
         ctx->state = STATE_CLOSE;

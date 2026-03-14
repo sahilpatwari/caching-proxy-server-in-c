@@ -2,15 +2,16 @@
 #define PROXY_H
 
 #include<netinet/in.h>
-
+#include <pthread.h>
+#include <stdatomic.h>
 #define BUFFER 8192
+
 
 struct ProxyRequest {
     char hostname[1024];
     int port;
     char path[4096];
 };
-
 
 typedef enum {
     STATE_READ_REQUEST,      // Waiting for/Reading the HTTP request from client
@@ -53,15 +54,47 @@ typedef struct {
     long upstream_content_length;
     long upstream_body_downloaded;
 
+    int is_chunked;     
+    int chunk_state;  // 0=READ_SIZE, 1=READ_DATA, 2=READ_CRLF, 3=DONE
+    long current_chunk_size;     
+    long current_chunk_bytes_read;
+    char hex_buf[32];
+    int hex_idx;
+    
+    int header_overshoot_len;
+    char header_overshoot_buf[BUFFER];
     char method[16];
     char url[5120];
     char protocol[16];
     struct ProxyRequest req;
-
+    
+    _Atomic int active_threads; 
+    pthread_mutex_t state_lock;
+    
     int file_fd;            
     off_t file_offset;     
     long bytes_remaining;   
 } ConnectionContext;
+
+typedef struct ConnectionNode {
+    int fd;
+    struct ConnectionNode* next;
+} ConnectionNode;
+
+typedef struct HostEntry{
+    char hostname[256];
+    int port;
+    ConnectionNode* fd_head;   
+    struct HostEntry* next_host;      
+} HostEntry;
+
+typedef struct HostBucket{
+    HostEntry* head;
+    pthread_mutex_t bucket_lock;
+}HostBucket;
+
+
+
 
 int parse_url(char*,struct ProxyRequest*);
 int connect_to_host(char*,int);
