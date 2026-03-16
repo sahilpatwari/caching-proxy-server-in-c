@@ -31,6 +31,16 @@
 
 // ATOMIC REQUEST ID COUNTER
 static _Atomic uint64_t global_req_id = 0;
+
+// SHUTDOWN FLAG
+volatile sig_atomic_t server_running = 1;
+
+// SIGNAL HANDLER
+void handle_shutdown_signal(int sig) {
+    (void)sig; // Suppress unused warning
+    server_running = 0; 
+}
+
 //EPOLL INSTANCE
 int epoll_fd;
 HostBucket connection_map[POOL_BUCKETS];
@@ -132,7 +142,7 @@ ConnectionContext* create_context(int fd) {
     if(!ctx) return NULL;
     struct sockaddr_storage addr;
     socklen_t addr_size = sizeof(addr);
-    if(getpeername(ctx->client_fd,(struct sockaddr*)&addr,&addr_size) == 0) {
+    if(getpeername(fd,(struct sockaddr*)&addr,&addr_size) == 0) {
           if(getnameinfo((struct sockaddr*)&addr,addr_size,ctx->client_ip,sizeof(ctx->client_ip),NULL,0,NI_NUMERICHOST) == -1) {
             strcpy(ctx->client_ip,"UNKNOWN");
         }
@@ -509,8 +519,6 @@ void* handle_state_machine(void* args) {
         }
     }
     
-    pthread_mutex_unlock(&ctx->state_lock);
-
     if(ctx->state != STATE_CLOSE) {
         struct epoll_event event;
         if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM || ctx->state == STATE_FETCH_UPSTREAM) {
@@ -540,6 +548,8 @@ void* handle_state_machine(void* args) {
             }
         }
     }
+
+    pthread_mutex_unlock(&ctx->state_lock);
 
     int remaining_threads = atomic_fetch_sub(&ctx->active_threads, 1) - 1;
 
@@ -695,6 +705,14 @@ int main() {
     int status, sockfd,newfd,yes = 1;
     
     signal(SIGPIPE, SIG_IGN); 
+
+    struct sigaction sa;
+    sa.sa_handler = handle_shutdown_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);  // Catch Ctrl+C
+    sigaction(SIGTERM, &sa, NULL); // Catch kill commands
+
     mkdir("cache", 0777);
     init_log(LEVEL_ERROR);
     init_rate_limiter();
@@ -758,10 +776,19 @@ int main() {
         exit(1);
     }
 
-    init_thread_pool(100,4096);
-    while(1) {
+    init_thread_pool(8,4096);
+    while(server_running) {
 
         int n_ready = epoll_wait(epoll_fd,events,MAX_FDS,-1);
+
+        if(n_ready == -1) {
+           if (errno == EINTR) {
+                continue; 
+            }
+            perror("epoll_wait");
+            break;
+        }
+
         for(int i = 0;i < n_ready;i++) {
             int currentfd = events[i].data.fd;
             if(currentfd == sockfd) {
@@ -788,5 +815,14 @@ int main() {
             }
         }   
     } 
+
+    printf("\nInitiating graceful shutdown sequence...\n");
+    destroy_thread_pool(); 
+    //destroy_rate_limiter(); 
+    close_log(); 
+    close(epoll_fd);
+    close(sockfd);
+
+    printf("Proxy shut down successfully. All resources freed.\n");
     return 0;
 }
