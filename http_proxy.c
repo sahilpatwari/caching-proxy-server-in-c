@@ -29,6 +29,7 @@
 #define MAX_FDS 10000 
 #define POOL_BUCKETS 1024
 
+extern void remove_from_cache_ram(char* url);
 // ATOMIC REQUEST ID COUNTER
 static _Atomic uint64_t global_req_id = 0;
 
@@ -161,6 +162,7 @@ ConnectionContext* create_context(int fd) {
     ctx->bytes_read = 0;
     ctx->write_len = 0;
     ctx->write_offset = 0;
+    ctx->is_designated_downloader = 0;
     ctx->bytes_remaining = 0;
     ctx->keep_alive = 1;
     context_table[fd] = ctx;
@@ -168,7 +170,12 @@ ConnectionContext* create_context(int fd) {
 }
 
 void free_context(ConnectionContext* ctx) {
-     if (ctx == NULL) return;
+    if (ctx == NULL) return;
+     
+    if(ctx->is_designated_downloader) {
+        remove_from_cache_ram(ctx->url);
+        ctx->is_designated_downloader = 0;
+    }
 
     if (ctx->upstream_fd != -1) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->upstream_fd, NULL);
@@ -178,6 +185,19 @@ void free_context(ConnectionContext* ctx) {
         close(ctx->upstream_fd);
         ctx->upstream_fd = -1;
     }
+    
+    if (ctx->file_fd != -1) {
+        close(ctx->file_fd);
+        ctx->file_fd = -1;
+
+        if(ctx->state == STATE_FETCH_UPSTREAM) {
+            char cache_file[256],temp_file[300];
+            get_cache_filename(ctx->url,cache_file);
+            snprintf(temp_file,sizeof(temp_file),"cache/%s.tmp.%d",cache_file,ctx->client_fd);
+
+            unlink(temp_file);
+        }
+    }
 
     if (ctx->client_fd != -1) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->client_fd, NULL);
@@ -186,10 +206,7 @@ void free_context(ConnectionContext* ctx) {
         ctx->client_fd = -1;
     }
 
-    if (ctx->file_fd != -1) {
-        close(ctx->file_fd);
-        ctx->file_fd = -1;
-    }
+
     free(ctx);
 }
 
@@ -481,7 +498,6 @@ void* handle_state_machine(void* args) {
 
     if(ctx == NULL) return NULL;
 
-    atomic_fetch_add(&ctx->active_threads, 1);
 
     pthread_mutex_lock(&ctx->state_lock);
     if(ctx->state != STATE_CLOSE) {
@@ -519,7 +535,7 @@ void* handle_state_machine(void* args) {
         }
     }
     
-    if(ctx->state != STATE_CLOSE) {
+    if(ctx->state != STATE_CLOSE && ctx->state != STATE_WAIT_CACHE) {
         struct epoll_event event;
         if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM || ctx->state == STATE_FETCH_UPSTREAM) {
             event.data.fd = ctx->upstream_fd;
@@ -548,12 +564,13 @@ void* handle_state_machine(void* args) {
             }
         }
     }
-
+    
+    int is_closed = (ctx->state == STATE_CLOSE) ? 1 : 0;
     pthread_mutex_unlock(&ctx->state_lock);
 
     int remaining_threads = atomic_fetch_sub(&ctx->active_threads, 1) - 1;
 
-    if(ctx->state == STATE_CLOSE && remaining_threads == 0) {
+    if(is_closed && remaining_threads == 0) {
         pthread_mutex_destroy(&ctx->state_lock);
         free_context(ctx);
     }
@@ -717,6 +734,7 @@ int main() {
     init_log(LEVEL_ERROR);
     init_rate_limiter();
     init_connection_pool();
+    init_cache_map();
     memset(&hints,0,sizeof hints);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -776,7 +794,7 @@ int main() {
         exit(1);
     }
 
-    init_thread_pool(8,4096);
+    init_thread_pool(100,4096);
     while(server_running) {
 
         int n_ready = epoll_wait(epoll_fd,events,MAX_FDS,-1);
@@ -811,7 +829,14 @@ int main() {
                 }
             } else {
                 ConnectionContext* ctx = context_table[currentfd];
-                submit_task(handle_state_machine,(void*)ctx);
+                
+                if(ctx != NULL) {
+                    atomic_fetch_add(&ctx->active_threads, 1);
+
+                    if(submit_task(handle_state_machine,(void*)ctx) != 0) {
+                        atomic_fetch_sub(&ctx->active_threads,1);
+                    }
+                }
             }
         }   
     } 

@@ -18,6 +18,7 @@ typedef enum {
     STATE_PARSE_REQUEST,     // Parsing headers (Method, URL, Keep-Alive)
     STATE_CHECK_CACHE,       // Determining if it's a Hit or Miss
     STATE_SEND_CACHE,        // Streaming file to client via sendfile()
+    STATE_WAIT_CACHE,        // Waiting for cache file download
     STATE_CONNECT_UPSTREAM,  // Non-blocking connect() to upstream server
     STATE_WAIT_CONNECT,      // Wait till handshake is complete
     STATE_SEND_UPSTREAM,     // Sends the HTTP GET request to upstream server
@@ -53,7 +54,8 @@ typedef struct {
     int checkCache;
     long upstream_content_length;
     long upstream_body_downloaded;
-
+    int is_designated_downloader;
+    
     int is_chunked;     
     int chunk_state;  // 0=READ_SIZE, 1=READ_DATA, 2=READ_CRLF, 3=DONE
     long current_chunk_size;     
@@ -94,7 +96,7 @@ typedef struct HostBucket{
 }HostBucket;
 
 
-
+void* handle_state_machine(void* args);
 
 int parse_url(char*,struct ProxyRequest*);
 int connect_to_host(char*,int);

@@ -5,6 +5,7 @@
 #include"proxy_log.h"
 #include"errors.h"
 
+void init_cache_map();
 void get_cache_filename(char*,char*);
 void enforce_cache_capacity();
 void handle_check_cache(ConnectionContext *ctx);
