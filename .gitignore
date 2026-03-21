@@ -60,3 +60,9 @@ cache/
 # Logs
 *.log
 proxy.log
+
+new/
+
+test.c
+
+cache_registry.bin
