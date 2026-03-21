@@ -26,7 +26,8 @@
 #define PORT "3490"
 #define BACKLOG SOMAXCONN
 #define BUFFER 8192
-#define MAX_FDS 10000 
+#define MAX_FDS 65536
+#define EPOLL_BATCH_SIZE 512
 #define POOL_BUCKETS 1024
 
 extern void remove_from_cache_ram(char* url);
@@ -141,11 +142,20 @@ ConnectionContext* create_context(int fd) {
     if(fd >= MAX_FDS) return NULL;
     ConnectionContext* ctx = calloc(1,sizeof(ConnectionContext));
     if(!ctx) return NULL;
+
+    ctx->send_mem_buf = NULL;
+    ctx->send_mem_len = 0;
+    ctx->send_mem_offset = 0;
+
     struct sockaddr_storage addr;
     socklen_t addr_size = sizeof(addr);
     if(getpeername(fd,(struct sockaddr*)&addr,&addr_size) == 0) {
-          if(getnameinfo((struct sockaddr*)&addr,addr_size,ctx->client_ip,sizeof(ctx->client_ip),NULL,0,NI_NUMERICHOST) == -1) {
-            strcpy(ctx->client_ip,"UNKNOWN");
+        if (addr.ss_family == AF_INET) {
+            inet_ntop(AF_INET, &((struct sockaddr_in*)&addr)->sin_addr,
+                      ctx->client_ip, sizeof(ctx->client_ip));
+        } else {
+            inet_ntop(AF_INET6, &((struct sockaddr_in6*)&addr)->sin6_addr,
+                      ctx->client_ip, sizeof(ctx->client_ip));
         }
     } else {
         strcpy(ctx->client_ip,"UNKNOWN");
@@ -254,7 +264,7 @@ void handle_send_upstream(ConnectionContext* ctx) {
 
         ctx->write_offset = 0;
         char *buffer_ptr;
-        char* headers_copy = malloc(BUFFER + 1);
+        char headers_copy[BUFFER + 1];
         char* end_of_headers = strstr(ctx->read_buf,"\r\n\r\n");
         if(end_of_headers) {
             int header_len = end_of_headers - ctx->read_buf;
@@ -275,7 +285,6 @@ void handle_send_upstream(ConnectionContext* ctx) {
             token = strtok_r(NULL,"\r\n",&buffer_ptr);
         }
         ctx->write_len += snprintf(ctx->write_buf + ctx->write_len,sizeof(ctx->write_buf) - ctx->write_len,"\r\n");
-        free(headers_copy);
     }
 
     while(ctx->write_offset < ctx->write_len) {
@@ -378,6 +387,7 @@ void handle_connect_upstream(ConnectionContext* ctx) {
     context_table[sockfd] = ctx;
     
     struct epoll_event event;
+    memset(&event,0,sizeof(event));
     event.data.fd = sockfd;
     event.events = EPOLLOUT | EPOLLONESHOT;
     if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sockfd, &event) == -1) {
@@ -433,7 +443,7 @@ void handle_parse_request(ConnectionContext* ctx) {
     }
     
     ctx->read_buf[ctx->bytes_read] = '\0';
-    int count = sscanf(ctx->read_buf,"%15s %5119s %15s",ctx->method,ctx->url,ctx->protocol);
+    int count = sscanf(ctx->read_buf,"%15s %511s %15s",ctx->method,ctx->url,ctx->protocol);
     if(count != 3) {
         send_error_response(ctx->client_fd, 400, "Invalid HTTP Request Format.",NULL);
         log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, "Malformed Request");
@@ -537,6 +547,7 @@ void* handle_state_machine(void* args) {
     
     if(ctx->state != STATE_CLOSE && ctx->state != STATE_WAIT_CACHE) {
         struct epoll_event event;
+        memset(&event,0,sizeof(event));
         if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM || ctx->state == STATE_FETCH_UPSTREAM) {
             event.data.fd = ctx->upstream_fd;
             if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM) {
@@ -734,7 +745,9 @@ int main() {
     init_log(LEVEL_ERROR);
     init_rate_limiter();
     init_connection_pool();
-    init_cache_map();
+    init_cache();
+    init_registry();
+    rehydrate_cache();
     memset(&hints,0,sizeof hints);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -784,7 +797,8 @@ int main() {
     }
 
     struct epoll_event event;
-    struct epoll_event events[MAX_FDS];
+    memset(&event,0,sizeof(event));
+    struct epoll_event events[EPOLL_BATCH_SIZE];
 
     event.data.fd = sockfd;
     event.events = EPOLLIN;
@@ -794,7 +808,7 @@ int main() {
         exit(1);
     }
 
-    init_thread_pool(100,4096);
+    init_thread_pool(8,4096);
     while(server_running) {
 
         int n_ready = epoll_wait(epoll_fd,events,MAX_FDS,-1);
@@ -821,7 +835,8 @@ int main() {
                         continue;
                     }
                     make_socket_non_blocking(newfd);
-
+                    int flag = 1;
+                    setsockopt(newfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
                     ConnectionContext* ctx = create_context(newfd);
                     event.data.fd = newfd;
                     event.events = EPOLLIN | EPOLLONESHOT;
@@ -832,7 +847,7 @@ int main() {
                 
                 if(ctx != NULL) {
                     atomic_fetch_add(&ctx->active_threads, 1);
-
+                    
                     if(submit_task(handle_state_machine,(void*)ctx) != 0) {
                         atomic_fetch_sub(&ctx->active_threads,1);
                     }
@@ -844,6 +859,7 @@ int main() {
     printf("\nInitiating graceful shutdown sequence...\n");
     destroy_thread_pool(); 
     //destroy_rate_limiter(); 
+    destroy_cache();
     close_log(); 
     close(epoll_fd);
     close(sockfd);

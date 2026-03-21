@@ -8,16 +8,16 @@
 
 
 struct ProxyRequest {
-    char hostname[1024];
+    char hostname[256];
     int port;
-    char path[4096];
+    char path[2048];
 };
 
 typedef enum {
     STATE_READ_REQUEST,      // Waiting for/Reading the HTTP request from client
     STATE_PARSE_REQUEST,     // Parsing headers (Method, URL, Keep-Alive)
     STATE_CHECK_CACHE,       // Determining if it's a Hit or Miss
-    STATE_SEND_CACHE,        // Streaming file to client via sendfile()
+    STATE_SEND_CACHE,        // Streaming file to client via sendfile() for larger payloads, for smaller payloads use send()(in-memory cache)
     STATE_WAIT_CACHE,        // Waiting for cache file download
     STATE_CONNECT_UPSTREAM,  // Non-blocking connect() to upstream server
     STATE_WAIT_CONNECT,      // Wait till handshake is complete
@@ -66,7 +66,7 @@ typedef struct {
     int header_overshoot_len;
     char header_overshoot_buf[BUFFER];
     char method[16];
-    char url[5120];
+    char url[512];
     char protocol[16];
     struct ProxyRequest req;
     
@@ -75,7 +75,11 @@ typedef struct {
     
     int file_fd;            
     off_t file_offset;     
-    long bytes_remaining;   
+    long bytes_remaining;  
+    
+    const char* send_mem_buf;
+    long send_mem_len;
+    long send_mem_offset;
 } ConnectionContext;
 
 typedef struct ConnectionNode {
@@ -99,5 +103,4 @@ typedef struct HostBucket{
 void* handle_state_machine(void* args);
 
 int parse_url(char*,struct ProxyRequest*);
-int connect_to_host(char*,int);
 #endif

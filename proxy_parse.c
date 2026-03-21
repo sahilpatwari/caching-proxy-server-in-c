@@ -18,7 +18,7 @@ int parse_url(char* url , struct ProxyRequest *req) {
     } else {
         host_len = path_start - host_start;
     }
-    if(host_len > 1023) return -1;
+    if(host_len > 255) return -1;
     strncpy(req->hostname,host_start,host_len);
     req->hostname[host_len] = '\0';
     if(path_start && *path_start == ':') {
@@ -27,8 +27,8 @@ int parse_url(char* url , struct ProxyRequest *req) {
     }
 
     if(path_start) {
-        strncpy(req->path,path_start,4095);
-        req->path[4095] = '\0';
+        strncpy(req->path,path_start,2047);
+        req->path[2047] = '\0';
     } else {
         strcpy(req->path,"/");
     }

@@ -15,64 +15,194 @@
 #include<errno.h>
 #include<fcntl.h>
 #include<sys/epoll.h>
+#include<netdb.h>
+#include<arpa/inet.h>
 #include"cache.h"
 #include"thread_pool.h"
 
-#define MAX_CACHE_SIZE 10*1024*1024 
-#define DEFAULT_TTL 300
-#define BUFFER 8192
-#define MAX_WAITERS 1024
+#define MAX_CACHE_MEM       (50 * 1024 * 1024)   // 50MB RAM budget
+#define LARGE_FILE_THRESHOLD (1 * 1024 * 1024)    // 1MB — above this use sendfile
+#define DEFAULT_TTL          300                 // 5 minutes
+#define CACHE_BUCKETS        8192
+#define MAX_WAITERS          1024
+#define EXPIRY_INTERVAL      60                    // Seconds between expiry sweeps
+#define PREFETCH_THRESHOLD   5                     // Min accesses to qualify for prefetch
+#define PREFETCH_WINDOW      30                    // Prefetch if expiring within this many seconds
+
 
 extern int epoll_fd;
 extern ConnectionContext* context_table[];
 extern void handle_connect_upstream(ConnectionContext* ctx);
 extern void handle_send_response_headers(ConnectionContext* ctx);
 extern void stash_connection(int fd,char* hostname,int port);
-static pthread_mutex_t eviction_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static FILE* registry_file = NULL;
+static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
-    char filename[256];
-    time_t mtime;
-    long size;
-}CacheEntry;
+    char action;
+    char url[512];
+    time_t expires_at;
+    unsigned long content_length;
+    int upstream_header_len;
+}RegistryRecord;
 
 typedef struct {
     time_t expires_at;
     long content_length;
     int upstream_header_len;
-    char url[5120];
+    char url[512];
     char padding[256];
 }CacheHeader;
 
-typedef struct CacheNode {
-    char url[5120];
-    time_t expires_at;
-    unsigned long content_length;
-    int is_downloading;
+void init_registry() {
+    registry_file = fopen("cache_registry.bin","ab+");
+    if(!registry_file) {
+        perror("Failed to open registry file! Fast boot disabled");
+    }
+}
 
+void append_to_registry(char action,char* url,time_t expires_at,unsigned content_length,int upstream_header_len) {
+    if(!registry_file) return;
+
+    RegistryRecord rec;
+    memset(&rec, 0, sizeof(RegistryRecord));
+    rec.action = action;
+    strncpy(rec.url,url,sizeof(rec.url) - 1);
+    rec.url[sizeof(rec.url) - 1] = '\0';
+    rec.expires_at = expires_at;
+    rec.content_length = content_length;
+    rec.upstream_header_len = upstream_header_len;
+
+    pthread_mutex_lock(&registry_lock);
+    fwrite(&rec,sizeof(RegistryRecord),1,registry_file);
+    fflush(registry_file);
+    pthread_mutex_unlock(&registry_lock);
+}
+
+
+typedef struct CacheNode {
+    char url[512];
+    time_t expires_at;
+
+    char* response;
+    long response_len;
+
+    int is_large;
+    long body_size;
+    int upstream_header_len;
+    
+    struct CacheNode* lru_prev;
+    struct CacheNode* lru_next;
+    
+    int is_downloading;
     void* waiters[MAX_WAITERS];
     int num_waiters;
 
     struct CacheNode* next;
+
+    long memory_usage;
 }CacheNode;
 
-static CacheNode* cache_table[BUFFER];
-static pthread_mutex_t cache_locks[BUFFER];
+static CacheNode* cache_table[CACHE_BUCKETS];
+static pthread_rwlock_t cache_locks[CACHE_BUCKETS];
+
+static CacheNode lru_sentinel;
+static pthread_mutex_t lru_lock = PTHREAD_MUTEX_INITIALIZER;
+static long total_cache_memory = 0;
+
+static pthread_t expiry_thread;
+static volatile int  cache_running;
+
 //djb2 hash algorithm
 unsigned long hash_url(char* url) {
     char* str = url;
     unsigned long hash = 5381;
     int c;
-    while(c = *str++) {
+    while((c = *str++)) {
         hash = ((hash << 5) + hash) + c;
     }
     return hash;
+} 
+
+static void lru_remove(CacheNode* node) {
+    if(node->lru_prev == NULL && node->lru_next == NULL) return;
+    node->lru_next->lru_prev = node->lru_prev;
+    node->lru_prev->lru_next = node->lru_next;
+    node->lru_prev = NULL;
+    node->lru_next = NULL;
+
 }
 
-void init_cache_map() {
+static void lru_push_front(CacheNode* node) {
+    node->lru_next = lru_sentinel.lru_next;
+    node->lru_prev = &lru_sentinel;
+    lru_sentinel.lru_next->lru_prev = node;
+    lru_sentinel.lru_next = node;
+}
+
+static void lru_touch(CacheNode* node) {
+     lru_remove(node);
+     lru_push_front(node);
+}
+
+static void lru_evict_if_needed() {
+    while(total_cache_memory >= MAX_CACHE_MEM) {
+        CacheNode* victim = lru_sentinel.lru_prev;
+        if(victim == &lru_sentinel) return; //Empty List
+
+        if(victim == lru_sentinel.lru_next) return;
+
+        while(victim != lru_sentinel.lru_next && victim->is_downloading && victim != &lru_sentinel) {
+            victim = victim->lru_prev;
+        }
+        if(victim == lru_sentinel.lru_next || victim == &lru_sentinel) break;
+        
+        lru_remove(victim);
+        total_cache_memory -= victim->memory_usage;
+
+        free(victim->response);
+        victim->response = NULL;
+        victim->response_len = 0;
+        victim->is_large = 1;
+        victim->memory_usage = 0;
+
+    }
+}
+void init_cache() {
     for(int i = 0; i < BUFFER; i++) {
         cache_table[i] = NULL;
-        pthread_mutex_init(&cache_locks[i],NULL);
+        pthread_rwlock_init(&cache_locks[i],NULL);
+    }
+    lru_sentinel.lru_prev = &lru_sentinel;
+    lru_sentinel.lru_next = &lru_sentinel;
+    total_cache_memory = 0;
+    
+    cache_running = 1;
+    //pthread_create(&expiry_thread,NULL,expiry_worker,NULL);
+}
+
+void destroy_cache() {
+    cache_running = 0;
+    //pthread_cancel(expiry_thread);
+    //pthread_join(&expiry_thread,NULL);
+
+    for(int i = 0; i < CACHE_BUCKETS; i++) {
+        pthread_rwlock_wrlock(&cache_locks[i]);
+        CacheNode* node = cache_table[i];
+        while(node) {
+            CacheNode* temp = node;
+            node = node->next;
+            free(temp->response);
+            free(temp);
+        }
+        pthread_rwlock_unlock(&cache_locks[i]);
+        pthread_rwlock_destroy(&cache_locks[i]);
+    }
+
+    if(registry_file) {
+        fclose(registry_file);
+        registry_file = NULL;
     }
 }
 
@@ -81,9 +211,7 @@ void get_cache_filename(char* url,char* buffer) {
     sprintf(buffer,"cache/%lu",hash);
 }
 
-void mark_as_used(char* filename) {
-    utimes(filename,NULL);
-}
+
 
 int parse_cache_policy(char* response_buffer) {
     int ttl = DEFAULT_TTL;// Default TTL
@@ -118,11 +246,10 @@ int parse_cache_policy(char* response_buffer) {
     return ttl;
 }
 
-int filter_headers_to_buffer(int client_fd,char* header_block,int block_len,char* headers,int offset) {
-    if (block_len < 0 || block_len >= BUFFER) return 0;
+int filter_headers_to_buffer(char* header_block,int block_len,char* headers,int offset) {
+    if (block_len < 0 || block_len >= BUFFER) return offset;
     char* save_ptr;
-    char* headers_copy = malloc(block_len + 1);
-    if(!headers_copy) return 0;
+    char headers_copy[BUFFER + 1];
     memcpy(headers_copy,header_block,block_len);
     headers_copy[block_len] = '\0';
 
@@ -135,19 +262,39 @@ int filter_headers_to_buffer(int client_fd,char* header_block,int block_len,char
             line = strtok_r(NULL,"\r\n",&save_ptr);
             continue;
         }
-        offset += snprintf(headers + strlen(headers),BUFFER - offset,"%s\r\n",line);
+        offset += snprintf(headers + offset,BUFFER - offset,"%s\r\n",line);
         line = strtok_r(NULL,"\r\n",&save_ptr);
     }
-    offset += snprintf(headers + strlen(headers),BUFFER - offset,"\r\n");
-    free(headers_copy);
+    offset += snprintf(headers + offset,BUFFER - offset,"\r\n");
     return offset;
+}
+
+static char* build_response(char* upstream_headers,int upstream_header_len,char* body,long body_size, long* out_len) {
+    char hdr_buffer[BUFFER];
+
+    int hdr_len = snprintf(hdr_buffer,sizeof(hdr_buffer),
+        "HTTP/1.1 200 OK\r\n"
+        "Connection: keep-alive\r\n"
+        "Content-Length: %ld\r\n"
+        "X-Cache: HIT\r\n",body_size);
+
+    hdr_len = filter_headers_to_buffer(upstream_headers,upstream_header_len,hdr_buffer,hdr_len);
+
+    long total = hdr_len + body_size;
+    char* resp = malloc(total + 1);
+    if(!resp) return NULL;
+
+    memcpy(resp,hdr_buffer,hdr_len);
+    memcpy(resp + hdr_len,body,body_size);
+    *out_len = total;
+    return resp;
 }
 
 void remove_from_cache_ram(char* url) {
     unsigned long hash = hash_url(url);
     int bucket = hash % BUFFER;
 
-    pthread_mutex_lock(&cache_locks[bucket]);
+    pthread_rwlock_wrlock(&cache_locks[bucket]);
     CacheNode *current = cache_table[bucket], *prev = NULL;
     while(current != NULL) {
         if(strcmp(url,current->url) == 0) {
@@ -165,33 +312,64 @@ void remove_from_cache_ram(char* url) {
             }
 
             if(prev == NULL) {
-                current = current->next;
+                cache_table[bucket] = current->next;
             } else {
                 prev->next = current->next;
             }
+            
+            pthread_mutex_lock(&lru_lock);
+            if(current->lru_prev != NULL) {
+                lru_remove(current);
+                total_cache_memory -= current->memory_usage;
+            }
+            pthread_mutex_unlock(&lru_lock);
 
+            free(current->response);
+            current->response = NULL;
             free(current);
-            pthread_mutex_unlock(&cache_locks[bucket]);
+            pthread_rwlock_unlock(&cache_locks[bucket]);
             return;
         }
         prev = current;
         current = current->next;
     }
-    pthread_mutex_unlock(&cache_locks[bucket]);
+    pthread_rwlock_unlock(&cache_locks[bucket]);
 }
 
-void add_to_cache_ram(char* url,time_t expires_at, size_t content_length) {
+void add_to_cache_ram(char* url,time_t expires_at,char* upstream_headers,int upstream_header_len,char* body,long body_size) {
     unsigned long hash = hash_url(url);
     int bucket = hash % BUFFER;
 
-    pthread_mutex_lock(&cache_locks[bucket]);
+    pthread_rwlock_wrlock(&cache_locks[bucket]);
     CacheNode* current = cache_table[bucket];
     while(current != NULL) {
         if(strcmp(url,current->url) == 0) {
             current->expires_at = expires_at;
-            current->content_length = content_length;
+            current->body_size = body_size;
+            current->upstream_header_len = upstream_header_len;
             current->is_downloading = 0;
+            
+            free(current->response);
+            current->response = NULL;
+            current->response_len = 0;
+            current->is_large = 0;
+         
+            if(body_size < LARGE_FILE_THRESHOLD && body != NULL) {
+                long resp_len = 0;
+                current->response = build_response(upstream_headers,upstream_header_len,body,body_size,&resp_len);
+                current->response_len = resp_len;
+                current->is_large = 0;
+                current->memory_usage = resp_len;
 
+                pthread_mutex_lock(&lru_lock);
+                total_cache_memory += resp_len;
+                lru_push_front(current);
+                lru_evict_if_needed();
+                pthread_mutex_unlock(&lru_lock);
+            } else {
+                current->is_large = 1;
+                current->memory_usage = 0;
+            }
             for(int i = 0; i < current->num_waiters; i++) {
                 ConnectionContext* waiter = current->waiters[i];
 
@@ -204,85 +382,141 @@ void add_to_cache_ram(char* url,time_t expires_at, size_t content_length) {
                 submit_task(handle_state_machine,waiter);
             }
             current->num_waiters = 0;
-            pthread_mutex_unlock(&cache_locks[bucket]);
+            pthread_rwlock_unlock(&cache_locks[bucket]);
             return;
         }
         current = current->next;
     }
-    pthread_mutex_unlock(&cache_locks[bucket]);
+    pthread_rwlock_unlock(&cache_locks[bucket]);
 }
 
-int check_cache_ram(void* ctx_ptr,size_t* file_size) {
-    ConnectionContext* ctx = (ConnectionContext*)ctx_ptr;
+int check_cache_ram(ConnectionContext* ctx) {
     unsigned long hash = hash_url(ctx->url);
     int bucket = hash % BUFFER;
     
-    pthread_mutex_lock(&cache_locks[bucket]);
+    pthread_rwlock_rdlock(&cache_locks[bucket]);
     CacheNode* current = cache_table[bucket];
     while(current != NULL) {
         if(strcmp(ctx->url,current->url) == 0) {
+            if(!current->is_downloading && current->expires_at > time(NULL) ) {
+                if(!current->is_large && current->response != NULL) {
+                    ctx->send_mem_buf = current->response;
+                    ctx->send_mem_len = current->response_len;
+                    ctx->send_mem_offset = 0;
+
+                    pthread_mutex_lock(&lru_lock);
+                    lru_touch(current);
+                    pthread_mutex_unlock(&lru_lock);
+                    pthread_rwlock_unlock(&cache_locks[bucket]);
+                    return 1; // Cache Hit
+                } else {
+                    ctx->bytes_remaining = current->body_size;
+                    ctx->upstream_header_len = current->upstream_header_len;
+                    ctx->send_mem_buf = NULL;
+                    pthread_rwlock_unlock(&cache_locks[bucket]);
+                    return 1; // Cache Hit
+                }
+            }
+            break;
+        }
+        current = current->next;
+    }
+    pthread_rwlock_unlock(&cache_locks[bucket]);
+
+    pthread_rwlock_wrlock(&cache_locks[bucket]);
+    current = cache_table[bucket];
+    while(current != NULL) {
+
+        if(strcmp(ctx->url,current->url) == 0) {
+            //Recheck in write lock
+            if(!current->is_downloading && current->expires_at > time(NULL) ) {
+                if(!current->is_large && current->response != NULL) {
+                        ctx->send_mem_buf = current->response;
+                        ctx->send_mem_len = current->response_len;
+                        ctx->send_mem_offset = 0;
+
+                        pthread_mutex_lock(&lru_lock);
+                        lru_touch(current);
+                        pthread_mutex_unlock(&lru_lock);
+                        pthread_rwlock_unlock(&cache_locks[bucket]);
+                        return 1; // Cache Hit
+                } else {
+                    ctx->bytes_remaining = current->body_size;
+                    ctx->upstream_header_len = current->upstream_header_len;
+                    ctx->send_mem_buf = NULL;
+                    pthread_rwlock_unlock(&cache_locks[bucket]);
+                    return 1; // Cache Hit
+                }
+            }
+
             if(current->is_downloading) {
                 if(current->num_waiters < MAX_WAITERS) {
                     current->waiters[current->num_waiters++] = ctx;
                     atomic_fetch_add(&ctx->active_threads,1);
-                    pthread_mutex_unlock(&cache_locks[bucket]);
+                    pthread_rwlock_unlock(&cache_locks[bucket]);
                     return 2;
                 }
 
-                pthread_mutex_unlock(&cache_locks[bucket]);
+                pthread_rwlock_unlock(&cache_locks[bucket]);
                 return 0;
             }
 
             if(current->expires_at < time(NULL)) {
                 current->is_downloading = 1;
                 current->num_waiters = 0;
-                pthread_mutex_unlock(&cache_locks[bucket]);
+
+                pthread_mutex_lock(&lru_lock);
+                if(current->lru_prev != NULL) {
+                    lru_remove(current);
+                    total_cache_memory -= current->memory_usage;
+                }
+                pthread_mutex_unlock(&lru_lock);
+                free(current->response);
+                current->response = NULL;
+                current->response_len = 0;
+                current->memory_usage = 0;
+
+                free(current);
+                pthread_mutex_unlock(&lru_lock);
+                pthread_rwlock_unlock(&cache_locks[bucket]);
                 return -1; // Expired
             } 
-            
-            *file_size = current->content_length;
-            pthread_mutex_unlock(&cache_locks[bucket]);
-            return 1; // Cache Hit
         }
         current = current->next;
     }
 
     CacheNode* new_node = malloc(sizeof(CacheNode));
+    if(!new_node) {
+        pthread_rwlock_unlock(&cache_locks[bucket]);
+    }
     strncpy(new_node->url,ctx->url,sizeof(new_node->url) - 1);
     new_node->url[sizeof(new_node->url) - 1] = '\0';
     new_node->is_downloading = 1;
     new_node->expires_at = 0;
-    new_node->content_length = 0;
-
+    new_node->upstream_header_len = 0;
+    new_node->is_large = 0;
     new_node->next = cache_table[bucket];
     cache_table[bucket] = new_node;
     
     ctx->is_designated_downloader = 1;
-    pthread_mutex_unlock(&cache_locks[bucket]);
+    pthread_rwlock_unlock(&cache_locks[bucket]);
     return 0; // Cache Miss;
 }
 
 int check_cache(ConnectionContext* ctx) {
-    size_t file_size = 0;
-    int status = check_cache_ram(ctx,&file_size);
-
-    if(status == 1) {
+    int status = check_cache_ram(ctx);
+    
+    if(status == 1 && ctx->send_mem_buf != NULL) return 1;
+    else if(status == 1 && ctx->send_mem_buf == NULL) {
         char cache_file[256];
         get_cache_filename(ctx->url,cache_file);
 
         ctx->file_fd = open(cache_file,O_RDONLY);
-        if(ctx->file_fd < 0) {
-            return 0;
-        }
-
-        ctx->bytes_remaining = file_size;
-        mark_as_used(cache_file);
+        if(ctx->file_fd < 0) return 0;
         return 1;
-    } else if(status == 2) {
-        return -1;
-    } else {
-         return 0;
-    }
+    } else if(status == 2) return -1;
+
+    return 0;
 }
 
 void handle_check_cache(ConnectionContext* ctx) {
@@ -299,8 +533,13 @@ void handle_check_cache(ConnectionContext* ctx) {
             return;
         }
     }
-
     //CACHE HIT
+    if(ctx->send_mem_buf != NULL) {
+        ctx->state = STATE_SEND_CACHE;
+        handle_send_cache(ctx);
+        return;
+    }
+    
     char file_buffer[BUFFER];
     int bytes_read = read(ctx->file_fd,file_buffer,sizeof(file_buffer));
     ctx->write_len = 0;
@@ -316,110 +555,69 @@ void handle_check_cache(ConnectionContext* ctx) {
                           "X-Cache: HIT\r\n");
     }
 
-    ctx->write_len = filter_headers_to_buffer(ctx->client_fd,file_buffer,ctx->upstream_header_len,ctx->write_buf,ctx->write_len);
+    ctx->write_len = filter_headers_to_buffer(file_buffer + sizeof(CacheHeader),ctx->upstream_header_len,ctx->write_buf,ctx->write_len);
     long body_offset = sizeof(CacheHeader) + ctx->upstream_header_len;
+    ctx->send_mem_buf = NULL;
     lseek(ctx->file_fd,body_offset,SEEK_SET);
     ctx->state = STATE_SEND_RESPONSE_HEADERS;
     handle_send_response_headers(ctx);
     return;
 }
 
-int compare_cache_entries(const void* a,const void* b) {
-    CacheEntry *entryA = (CacheEntry*)a;
-    CacheEntry *entryB = (CacheEntry*)b;
-    return (entryA->mtime - entryB->mtime);
-}
-
-void enforce_cache_capacity() {
-
-    if(pthread_mutex_trylock(&eviction_lock) != 0) {
-        return;
-    }
-
-    DIR *d;
-    struct dirent *dir;
-    struct stat filestat;
-    char file_path[270];
-    
-    int max_files = 10000;
-    CacheEntry *entries = malloc(max_files*sizeof(CacheEntry));
-    if(!entries) {
-        perror("malloc");
-        pthread_mutex_unlock(&eviction_lock);
-        return;
-    }
-    int count = 0;
-    long total_size = 0;
-
-    d = opendir("cache");
-    if(!d) {
-        fprintf(stderr,"Could not open directory");
-        free(entries);
-        pthread_mutex_unlock(&eviction_lock);
-        return;
-    }
-    
-    while((dir = readdir(d))) {
-        if(dir->d_name[0] == '.') continue;
-        
-        snprintf(file_path,sizeof(file_path),"cache/%s",dir->d_name);
-
-        if(stat(file_path,&filestat) == 0) {
-              strcpy(entries[count].filename,file_path);
-              entries[count].mtime = filestat.st_mtime;
-              entries[count].size = filestat.st_size;
-
-              total_size += filestat.st_size;
-              count++;
-
-              if(count >= 10000) break;
-        }
-    }
-    closedir(d);
-    if(total_size > MAX_CACHE_SIZE) {
-        qsort(entries,count,sizeof(CacheEntry),compare_cache_entries);
-        int i = 0;
-        while(total_size > MAX_CACHE_SIZE && i < count) {
-            printf("Cache Overflow (%ld/%d bytes). Evicting %s\n",total_size,MAX_CACHE_SIZE,entries[i].filename);
-            if(remove(entries[i].filename) == 0) {
-                total_size -= entries[i].size;
-            } else {
-                perror("Failed to delete cache file");
-            }
-            i++;
-        }
-    }
-    free(entries);
-    pthread_mutex_unlock(&eviction_lock);
-}
-
 void handle_send_cache(ConnectionContext *ctx) {
-    while(ctx->bytes_remaining > 0) {
-        ssize_t bytes_sent = sendfile(ctx->client_fd, ctx->file_fd, NULL , ctx->bytes_remaining);
-        if (bytes_sent < 0) {
-            if(errno == EWOULDBLOCK || errno == EAGAIN) {
-                return;
-            }
+    if(ctx->send_mem_buf != NULL) {
+        while(ctx->send_mem_offset < ctx->send_mem_len) {
+            long bytes_sent = send(ctx->client_fd,ctx->send_mem_buf + ctx->send_mem_offset, 
+                                 ctx->send_mem_len - ctx->send_mem_offset,MSG_NOSIGNAL);
+            if(bytes_sent < 0) {
+                if(errno == EWOULDBLOCK || errno == EAGAIN) {
+                    return;
+                }
 
-            if(errno == EPIPE || errno == ECONNRESET) {
+                if(errno == EPIPE || errno == ECONNRESET) {
+                    ctx->state = STATE_CLOSE;
+                    return;
+                }
+                perror("send failure");
+                ctx->state = STATE_CLOSE;
+                return;
+            } else if(bytes_sent == 0) {
+                ctx->state = STATE_CLOSE;
+                return;
+            } 
+            ctx->send_mem_offset += bytes_sent;
+        }
+        ctx->send_mem_buf = NULL;
+        ctx->send_mem_len = 0;
+        ctx->send_mem_offset = 0;
+    } else {
+        while(ctx->bytes_remaining > 0) {
+            ssize_t bytes_sent = sendfile(ctx->client_fd, ctx->file_fd, NULL , ctx->bytes_remaining);
+            if (bytes_sent < 0) {
+                if(errno == EWOULDBLOCK || errno == EAGAIN) {
+                    return;
+                }
+
+                if(errno == EPIPE || errno == ECONNRESET) {
+                    ctx->state = STATE_CLOSE;
+                    return;
+                }
+                
+                perror("sendfile failed");
+                ctx->state = STATE_CLOSE;
+                return;
+            } else if(bytes_sent == 0) {
                 ctx->state = STATE_CLOSE;
                 return;
             }
-            
-            perror("sendfile failed");
-            ctx->state = STATE_CLOSE;
-            return;
-        } else if(bytes_sent == 0) {
-            ctx->state = STATE_CLOSE;
-            return;
+            ctx->bytes_remaining -= bytes_sent;
         }
-        ctx->bytes_remaining -= bytes_sent;
+        close(ctx->file_fd);
+        ctx->file_fd = -1;
     }
-    close(ctx->file_fd);
-    ctx->file_fd = -1;
+
     if(ctx->keep_alive) {
         ctx->bytes_read = 0;
-        memset(ctx->read_buf,0,sizeof(ctx->read_buf));
 
         ctx->write_len = 0;
         ctx->write_offset = 0;
@@ -434,10 +632,12 @@ void handle_send_cache(ConnectionContext *ctx) {
         ctx->header_overshoot_len = 0;
 
         ctx->checkCache = 0;
-        memset(&(ctx->req),0,sizeof(ctx->req));
-        memset(ctx->method,0,sizeof(ctx->method));
-        memset(ctx->url,0,sizeof(ctx->url));
-        memset(ctx->protocol,0,sizeof(ctx->protocol));
+        ctx->read_buf[0] = '\0';
+        ctx->method[0] = '\0';
+        ctx->url[0] = '\0';
+        ctx->protocol[0] = '\0';
+        ctx->req.hostname[0] = '\0';
+        ctx->req.path[0] = '\0';
         ctx->state = STATE_READ_REQUEST;
     } else {
         ctx->state = STATE_CLOSE;
@@ -642,7 +842,9 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
     finalHeader.content_length = st.st_size - sizeof(CacheHeader);
     ctx->bytes_remaining = finalHeader.content_length - ctx->upstream_header_len;
     finalHeader.upstream_header_len = ctx->upstream_header_len;
-    ctx->upstream_content_length = finalHeader.content_length;
+    
+    long body_size = finalHeader.content_length - ctx->upstream_header_len;
+
     lseek(ctx->file_fd,0,SEEK_SET);
     write(ctx->file_fd,&finalHeader,sizeof(finalHeader));
 
@@ -653,26 +855,229 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
         ctx->file_fd = open(temp_file, O_RDONLY);
 
         unlink(temp_file);
-    } else {
-        if(rename(temp_file,cache_file) == 0) {
-            add_to_cache_ram(ctx->url,finalHeader.expires_at,ctx->bytes_remaining);
-            ctx->is_designated_downloader = 0;
-        }
-
-        enforce_cache_capacity();
-
-        ctx->file_fd = open(cache_file,O_RDONLY);
-    }
-
-
-    if(ctx->file_fd < 0) {
-        ctx->state = STATE_CLOSE;
+        if(ctx->file_fd < 0) { ctx->state = STATE_CLOSE; return;}
+        ctx->send_mem_buf = NULL;
+        ctx->checkCache = 0;
+        ctx->state = STATE_CHECK_CACHE;
+        handle_check_cache(ctx);
         return;
     }
-    lseek(ctx->file_fd, sizeof(CacheHeader), SEEK_SET);
-    ctx->checkCache = 0;
-    ctx->state = STATE_CHECK_CACHE;
-    handle_check_cache(ctx);
-    return;
+
+    if(rename(temp_file,cache_file) != 0) {
+        ctx->state = STATE_CLOSE;
+    }
+
+    int read_fd = open(cache_file,O_RDONLY);
+    if(read_fd < 0) {ctx->state = STATE_CLOSE; return;}
+
+    char file_buf[BUFFER];
+    lseek(read_fd,sizeof(CacheHeader),SEEK_SET);
+    int hdr_read = read(read_fd,file_buf,ctx->upstream_header_len);
+    if(hdr_read < ctx->upstream_header_len) {
+        ctx->state = STATE_CLOSE;
+        close(read_fd);
+        read_fd = -1;
+        return;
+    }
+    
+    if(body_size < LARGE_FILE_THRESHOLD) {
+        char* body_buf = malloc(body_size);
+        if(body_buf) {
+            long total_read = 0;
+            while(total_read < body_size) {
+                int r = read(read_fd,body_buf + total_read, body_size - total_read);
+                if(r <= 0) { 
+                    close(read_fd);
+                    free(body_buf);
+                    ctx->state = STATE_CLOSE; 
+                    return;
+                }
+                total_read += r;
+            }
+            add_to_cache_ram(ctx->url, finalHeader.expires_at,file_buf, ctx->upstream_header_len,body_buf, body_size);
+            ctx->is_designated_downloader = 0;
+            append_to_registry('A', ctx->url, finalHeader.expires_at,finalHeader.content_length, ctx->upstream_header_len);
+            free(body_buf);
+        }
+        close(read_fd);
+
+        ctx->checkCache = 1;
+        ctx->state = STATE_CHECK_CACHE;
+        handle_check_cache(ctx);
+        return;
+    } else {
+        add_to_cache_ram(ctx->url, finalHeader.expires_at,file_buf, ctx->upstream_header_len,NULL, body_size);
+        ctx->is_designated_downloader = 0;
+        append_to_registry('A', ctx->url, finalHeader.expires_at,finalHeader.content_length, ctx->upstream_header_len);
+        close(read_fd);
+
+        ctx->file_fd = open(cache_file,O_RDONLY);
+        if(ctx->file_fd < 0) { ctx->state = STATE_CLOSE;  return; }
+        lseek(ctx->file_fd, sizeof(CacheHeader), SEEK_SET);
+        ctx->checkCache = 0;
+        ctx->send_mem_buf = NULL;
+        ctx->state = STATE_CHECK_CACHE;
+        handle_check_cache(ctx);
+        return;
+    }
+}
+
+void rehydrate_cache() {
+
+    FILE* reg = fopen("cache_registry.bin","rb+");
+
+    if(reg) {
+        fseek(reg,0,SEEK_END);
+        long file_size = ftell(reg);
+        rewind(reg);
+
+        if(file_size > 0) {
+            RegistryRecord rec;
+            while(fread(&rec,sizeof(RegistryRecord),1,reg) == 1) {
+                if(rec.expires_at > time(NULL) && rec.action == 'A') {
+                    char cache_file[256];
+                    get_cache_filename(rec.url,cache_file);
+
+                    int read_fd = open(cache_file,O_RDONLY);
+                    if(read_fd < 0) continue;
+                    
+                    lseek(read_fd,sizeof(CacheHeader),SEEK_SET);
+                    char hdr_buf[BUFFER];
+                    int hdr_len = read(read_fd,hdr_buf,rec.upstream_header_len);
+                    if(hdr_len > 0 && hdr_len < rec.upstream_header_len) {
+                        continue;
+                    }
+
+                    long body_size = rec.content_length - rec.upstream_header_len;
+                    if(body_size > 0 && body_size < LARGE_FILE_THRESHOLD) {
+                        char* body = malloc(body_size);
+                        if(body) {
+                            long total_read = 0;
+                            while(total_read < body_size) {
+                                int r = read(read_fd,body + total_read,body_size - total_read);
+                                if(r <= 0) {
+                                    close(read_fd);
+                                    free(body);
+                                    total_read = 0;
+                                    break;
+                                }
+                                total_read += r;
+                            }
+                            if(total_read == 0) continue;
+                        }
+
+                        unsigned long hash = hash_url(rec.url);
+                        int bucket = hash % CACHE_BUCKETS;
+
+                        pthread_rwlock_wrlock(&cache_locks[bucket]);
+                        CacheNode* node = calloc(1,sizeof(CacheNode));
+                        if(node) {
+                            strncpy(node->url,rec.url,sizeof(rec.url) - 1);
+                            node->is_downloading = 1;
+                            node->next = cache_table[bucket];
+                            cache_table[bucket] = node;
+                        }
+
+                        pthread_rwlock_unlock(&cache_locks[bucket]);
+
+                        add_to_cache_ram(rec.url, rec.expires_at,hdr_buf, hdr_len, body, body_size);
+                        free(body);
+                    } else {
+                        unsigned long hash = hash_url(rec.url);
+                        int bucket = hash % CACHE_BUCKETS;
+                        pthread_rwlock_wrlock(&cache_locks[bucket]);
+                        CacheNode* node = calloc(1,sizeof(CacheNode));
+                        if(node) {
+                            strncpy(node->url,rec.url,sizeof(rec.url) - 1);
+                            node->is_downloading = 1;
+                            node->next = cache_table[bucket];
+                            cache_table[bucket] = node;
+                        }
+
+                        pthread_rwlock_unlock(&cache_locks[bucket]);
+
+                        add_to_cache_ram(rec.url, rec.expires_at,hdr_buf, hdr_len, NULL, body_size);
+                    }
+                    close(read_fd);
+                }
+            }
+            fclose(reg);
+            return;
+        }
+        fclose(reg);
+    }
+
+    DIR* dir = opendir("cache");
+    if(!dir) return;
+
+    struct dirent *entry;
+    while((entry = readdir(dir)) != NULL) {
+        if(entry->d_name[0] == '.') continue;
+
+        char filepath[1024];
+        snprintf(filepath,sizeof(filepath),"cache/%s",entry->d_name);
+
+        if(strstr(entry->d_name,"tmp")) {
+            unlink(filepath);
+            continue;
+        }
+
+        int read_fd = open(entry->d_name,O_RDONLY);
+        if(read_fd < 0) continue;
+
+        CacheHeader header;
+        while(read(read_fd,&header,sizeof(CacheHeader)) == sizeof(CacheHeader)) {
+            if(header.expires_at > time(NULL)) {
+                char hdr_buf[BUFFER];
+                int hdr_len = read(read_fd,hdr_buf,header.upstream_header_len);
+                if(hdr_len > 0 && hdr_len < header.upstream_header_len) {
+                    continue;
+                }
+
+                long body_size = header.content_length - header.upstream_header_len;
+                if(body_size > 0 && body_size < LARGE_FILE_THRESHOLD) {
+                    char* body = malloc(body_size);
+                    if(body) {
+                        long total_read = 0;
+                        while(total_read < body_size) {
+                            int r = read(read_fd,body + total_read,body_size - total_read);
+                            if(r <= 0) {
+                                close(read_fd);
+                                free(body);
+                                total_read = 0;
+                                break;
+                            }
+                            total_read += r;
+                        }
+                        if(total_read == 0) break;
+                    }
+
+                    unsigned long hash = hash_url(header.url);
+                    int bucket = hash % CACHE_BUCKETS;
+
+                    pthread_rwlock_wrlock(&cache_locks[bucket]);
+                    CacheNode* node = calloc(1,sizeof(CacheNode));
+                    if(node) {
+                        strncpy(node->url,header.url,sizeof(header.url) - 1);
+                        node->is_downloading = 1;
+                        node->next = cache_table[bucket];
+                        cache_table[bucket] = node;
+                    }
+
+                    pthread_rwlock_unlock(&cache_locks[bucket]);
+
+                    add_to_cache_ram(header.url, header.expires_at,hdr_buf, hdr_len, body, body_size);
+                    free(body);
+                } else {
+                    add_to_cache_ram(header.url, header.expires_at,hdr_buf, hdr_len,NULL, body_size);
+                }
+                append_to_registry('A', header.url, header.expires_at,header.content_length, header.upstream_header_len);
+            } else {
+                unlink(filepath);
+            }
+        }
+        close(read_fd);
+    }
+    closedir(dir);
 }
 
