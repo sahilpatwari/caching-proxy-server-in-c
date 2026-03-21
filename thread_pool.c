@@ -7,12 +7,12 @@
 typedef struct Task{
     void* (*function)(void*);
     void* args;
-    struct Task* next;
 }Task;
 
 static struct {
-    Task* head;
-    Task* tail;
+    Task* queue;
+    int head;
+    int tail;
     pthread_mutex_t lock;
     pthread_cond_t notify;
     pthread_t* threads;
@@ -26,26 +26,23 @@ static void* worker_thread(void* args) {
     while(1) {
         pthread_mutex_lock(&pool.lock);
 
-        while(pool.head == NULL && !pool.shutdown) {
+        while(pool.queue_size == 0 && !pool.shutdown) {
             pthread_cond_wait(&pool.notify,&pool.lock);
         }
 
-        if(pool.shutdown && pool.head == NULL) {
+        if(pool.shutdown && pool.queue_size == 0) {
             pthread_mutex_unlock(&pool.lock);
             break;
         }
 
-        Task* task = pool.head;
-        pool.head = pool.head->next;
-        if(pool.head == NULL) {
-            pool.tail = NULL;
-        }
+        Task task = pool.queue[pool.head];
+        pool.head = (pool.head + 1) % pool.max_queue_size;
         pool.queue_size--;
+
         pthread_mutex_unlock(&pool.lock);
 
-        if(task != NULL) {
-            (*(task->function))(task->args);
-            free(task);
+        if(task.function != NULL) {
+            (*(task.function))(task.args);
         }
     }
     return NULL;
@@ -54,10 +51,13 @@ static void* worker_thread(void* args) {
 void init_thread_pool(int numThreads,int maxQueue) {
     pool.thread_count = numThreads;
     pool.shutdown = 0;
-    pool.head = NULL;
-    pool.tail = NULL;
+    pool.head = 0;
+    pool.tail = 0;
     pool.queue_size = 0;
     pool.max_queue_size = maxQueue;
+
+    pool.queue = malloc(maxQueue * sizeof(Task));
+
     pthread_mutex_init(&pool.lock,NULL);
     pthread_cond_init(&pool.notify,NULL);
 
@@ -71,29 +71,20 @@ void init_thread_pool(int numThreads,int maxQueue) {
 }
 
 int submit_task(void* (*function)(void*),void* args) {
-    Task* task = malloc(sizeof(Task));
-    task->function = function;
-    task->args = args;
-    task->next = NULL;
-
     pthread_mutex_lock(&pool.lock);
 
     if(pool.queue_size >= pool.max_queue_size) {
         pthread_mutex_unlock(&pool.lock);
-        free(task);
         return -1;
     }
 
-    if(pool.tail == NULL) {
-        pool.head = task;
-        pool.tail = task;
-    } else {
-        pool.tail->next = task;
-        pool.tail = pool.tail->next;
-    }
+    pool.queue[pool.tail].function = function;
+    pool.queue[pool.tail].args = args;
+    pool.tail = (pool.tail + 1) % pool.max_queue_size;
+
     pool.queue_size++;
-    pthread_cond_signal(&pool.notify);
     pthread_mutex_unlock(&pool.lock);
+    pthread_cond_signal(&pool.notify);
     return 0;
 }
 
@@ -108,6 +99,7 @@ void destroy_thread_pool() {
     }
     
     free(pool.threads);
+    free(pool.queue);
     pthread_mutex_destroy(&pool.lock);
     pthread_cond_destroy(&pool.notify);
 }
