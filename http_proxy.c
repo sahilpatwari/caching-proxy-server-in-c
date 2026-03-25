@@ -17,7 +17,7 @@
 #include<errno.h>
 #include<fcntl.h>
 #include<sys/epoll.h>
-
+#include <sys/resource.h> 
 
 #include"cache.h"
 #include"rate_limiter.h"
@@ -30,7 +30,8 @@
 #define EPOLL_BATCH_SIZE 512
 #define POOL_BUCKETS 1024
 
-extern void remove_from_cache_ram(char* url);
+extern void abort_cache_download(char* url);
+extern int purge_cache_entry(char* url);
 // ATOMIC REQUEST ID COUNTER
 static _Atomic uint64_t global_req_id = 0;
 
@@ -42,6 +43,26 @@ void handle_shutdown_signal(int sig) {
     (void)sig; // Suppress unused warning
     server_running = 0; 
 }
+
+// TELEMETRY GLOBALS
+_Atomic uint64_t metric_cache_hits = 0;
+_Atomic uint64_t metric_cache_misses = 0;
+_Atomic uint64_t metric_total_requests = 0;
+_Atomic uint64_t metric_current_rps = 0;
+
+// System Level: Hardware Metrics
+_Atomic double metric_cpu_usage = 0.0;
+_Atomic long metric_memory_rss_kb = 0;
+extern long total_cache_memory;
+time_t server_start_time;
+
+static struct upstream_config {
+    char hostname[256];
+    int port;
+    struct sockaddr_storage resolved_addr;
+    socklen_t resolved_addr_len;
+    int is_resolved;
+}upstream_config;
 
 //EPOLL INSTANCE
 int epoll_fd;
@@ -55,6 +76,48 @@ static unsigned long hash_host(const char* hostname,int port) {
     }
     hash = ((hash << 5) + hash) + port;
     return hash % POOL_BUCKETS;
+}
+
+void* telemetry_worker(void* arg) {
+    uint64_t last_total_requests = 0;
+    double last_cpu_time = 0.0;
+    long page_size = sysconf(_SC_PAGESIZE); // Usually 4096 bytes
+
+    while(1) { 
+        // 1. HARDWARE-ACCURATE CPU USAGE (Nanosecond Precision)
+        struct timespec ts;
+        if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) == 0) {
+            // Convert seconds and nanoseconds into a single double
+            double current_cpu = (double)ts.tv_sec + ((double)ts.tv_nsec / 1000000000.0);
+            
+            if (last_cpu_time > 0.0) {
+                // If it consumed 0.5 seconds of CPU time in the last 1.0 wall-clock seconds, that is 50% CPU.
+                // Across 12 cores, max is 1200%
+                metric_cpu_usage = (current_cpu - last_cpu_time) * 100.0;
+            }
+            last_cpu_time = current_cpu;
+        }
+
+        // 2. BULLETPROOF RAM USAGE (Page Table Math)
+        FILE* fp = fopen("/proc/self/statm", "r");
+        if (fp) {
+            long size, resident;
+            // statm format: size resident shared text lib data dt
+            if (fscanf(fp, "%ld %ld", &size, &resident) == 2) {
+                // resident is in Pages. Multiply by page_size to get bytes, divide by 1024 for KB
+                metric_memory_rss_kb = (resident * page_size) / 1024;
+            }
+            fclose(fp);
+        }
+
+        uint64_t current_total = metric_total_requests;
+        metric_current_rps = current_total - last_total_requests;
+        last_total_requests = current_total;
+
+        sleep(1);
+    }
+
+    return NULL;
 }
 
 void init_connection_pool() {
@@ -183,7 +246,7 @@ void free_context(ConnectionContext* ctx) {
     if (ctx == NULL) return;
      
     if(ctx->is_designated_downloader) {
-        remove_from_cache_ram(ctx->url);
+        abort_cache_download(ctx->url);
         ctx->is_designated_downloader = 0;
     }
 
@@ -319,6 +382,11 @@ void handle_send_upstream(ConnectionContext* ctx) {
 }
 
 void handle_connect_upstream(ConnectionContext* ctx) {
+    
+    strncpy((ctx->req).hostname,upstream_config.hostname,sizeof((ctx->req).hostname) - 1);
+    (ctx->req).port = upstream_config.port;
+    strncpy((ctx->req).path, ctx->url, sizeof((ctx->req).path) - 1);
+    (ctx->req).path[sizeof((ctx->req).path) - 1] = '\0';
 
     int warmfd = get_pool_connection((ctx->req).hostname,(ctx->req).port);
     if(warmfd != -1) {
@@ -339,44 +407,29 @@ void handle_connect_upstream(ConnectionContext* ctx) {
         handle_send_upstream(ctx);
         return;
     }
-
-    struct addrinfo hints, *res, *p;
-    int sockfd,status,connect_res = -1;
-
-    char port_str[16];
-    snprintf(port_str,sizeof(port_str),"%d",(ctx->req).port);
     
-    memset(&hints,0,sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    if((status = getaddrinfo((ctx->req).hostname,port_str,&hints,&res)) == -1) {
-        fprintf(stderr,"getaddrinfo: %s\n",gai_strerror(status));
-        send_error_response(ctx->client_fd, 502, "Bad Gateway", NULL);
+    if(!upstream_config.is_resolved) {
+        fprintf(stderr, "Proxy Error: Upstream DNS never resolved at startup!\n");
+        send_error_response(ctx->client_fd, 502, "Bad Gateway (DNS)", NULL);
         ctx->state = STATE_CLOSE;
         return;
     }
+    
 
-    for(p = res;p != NULL;p = p->ai_next) {
-        if((sockfd = socket(p->ai_family,p->ai_socktype,p->ai_protocol)) == -1) {
-            continue;
-        }
-        
-        make_socket_non_blocking(sockfd);
+    int sockfd,connect_res = -1;
+    if((sockfd = socket(upstream_config.resolved_addr.ss_family,SOCK_STREAM,0)) == -1) {
+        send_error_response(ctx->client_fd, 502, "Bad Gateway (Socket)", NULL);
+        ctx->state = STATE_CLOSE;
+        return;
+    }
+    
+    make_socket_non_blocking(sockfd);
 
-        connect_res = connect(sockfd,p->ai_addr,p->ai_addrlen);
-
-        if(connect_res == 0) {
-            break;
-        } else if(connect_res < 0 && errno == EINPROGRESS){
-            break;
-        }
-
+    connect_res = connect(sockfd,(struct sockaddr*)&upstream_config.resolved_addr,upstream_config.resolved_addr_len);
+    
+    if(connect_res < 0 && errno != EINPROGRESS) {
         close(sockfd);
         sockfd = -1;
-    }
-    freeaddrinfo(res);
-    if(p == NULL) {
         fprintf(stderr,"The proxy couldn't connect to host %s\n",(ctx->req).hostname);
         send_error_response(ctx->client_fd, 502, "Bad Gateway", NULL);
         ctx->state = STATE_CLOSE;
@@ -436,12 +489,6 @@ void handle_parse_request(ConnectionContext* ctx) {
         return;
     }*/
 
-    if(strstr(ctx->read_buf,"Connection:close") || strstr(ctx->read_buf,"Connection: close")) {
-        ctx->keep_alive = 0;
-    } else {
-        ctx->keep_alive = 1;
-    }
-    
     ctx->read_buf[ctx->bytes_read] = '\0';
     int count = sscanf(ctx->read_buf,"%15s %511s %15s",ctx->method,ctx->url,ctx->protocol);
     if(count != 3) {
@@ -450,25 +497,91 @@ void handle_parse_request(ConnectionContext* ctx) {
         ctx->state = STATE_CLOSE;
         return;
     }
-
-    if(parse_url(ctx->url,&(ctx->req)) != 0) {
-        send_error_response(ctx->client_fd, 400, "Invalid URL Format.",NULL);
-        log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, "Invalid URL");
-        ctx->state = STATE_CLOSE;
-        return;
+    
+    if(strstr(ctx->protocol,"HTTP/1.0") != NULL && strstr(ctx->read_buf,"Connection: Keep-Alive") == NULL) {
+        ctx->keep_alive = 0;
     }
+    else if(strstr(ctx->read_buf,"Connection:close") || strstr(ctx->read_buf,"Connection: close")) {
+        ctx->keep_alive = 0;
+    } else {
+        ctx->keep_alive = 1;
+    }
+
     //printf("[Proxy] Request: %s %s\n", method, url);
     char log_buf[1536];
     snprintf(log_buf, sizeof(log_buf), "Request: %s %s:%d", ctx->method, (ctx->req).hostname, (ctx->req).port);
     log_event(LEVEL_INFO, ctx->req_id, ctx->client_ip, log_buf);
+    
+    atomic_fetch_add(&metric_total_requests,1);
+    
+    if(strcmp(ctx->method,"PURGE") == 0) {
+        int purge_status = purge_cache_entry(ctx->url);
+        
+        if (purge_status == 200) {
+            ctx->write_len = snprintf(ctx->write_buf, sizeof(ctx->write_buf),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                "{\"status\": \"purged\", \"path\": \"%s\"}", ctx->url);
+        } 
+        else if (purge_status == 409) {
+            ctx->write_len = snprintf(ctx->write_buf, sizeof(ctx->write_buf),
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                "{\"error\": \"File is actively being fetched. Try again.\"}");
+        } 
+        else {
+            ctx->write_len = snprintf(ctx->write_buf, sizeof(ctx->write_buf),
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                "{\"error\": \"Not in cache\", \"path\": \"%s\"}", ctx->url);
+        }
+
+        ctx->bytes_remaining = 0;
+        ctx->file_fd = -1;
+        ctx->keep_alive = 0;
+        ctx->state = STATE_SEND_RESPONSE_HEADERS;
+        return;
+    }
 
     if(strncmp(ctx->method,"GET",3) == 0) {
+        if(strcmp(ctx->url,"/stats") == 0) {
+            uint64_t hits = metric_cache_hits;
+            uint64_t misses = metric_cache_misses;
+            uint64_t total = hits + misses;
+            double hit_ratio = total > 0 ? ((double)hits / total)* 100.0 : 0.0;
+            long uptime = time(NULL) - server_start_time;
+
+            ctx->write_len = snprintf(ctx->write_buf, sizeof(ctx->write_buf),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n\r\n"
+                "{\n"
+                "  \"server_uptime_seconds\": %ld,\n"
+                "  \"traffic\": {\n"
+                "    \"current_rps\": %lu,\n"
+                "    \"total_requests\": %lu\n"
+                "  },\n"
+                "  \"cache\": {\n"
+                "    \"hit_ratio_percent\": %.2f,\n"
+                "    \"total_hits\": %lu,\n"
+                "    \"total_misses\": %lu,\n"
+                "    \"tracked_ram_bytes\": %ld\n"
+                "  },\n"
+                "  \"hardware\": {\n"
+                "    \"cpu_usage_percent\": %.2f,\n"
+                "    \"memory_rss_kb\": %ld\n"
+                "  }\n"
+                "}", 
+                uptime, metric_current_rps, metric_total_requests, 
+                hit_ratio, hits, misses, total_cache_memory,
+                metric_cpu_usage, metric_memory_rss_kb);
+                
+                ctx->bytes_remaining = 0;
+                ctx->file_fd = -1;
+                ctx->keep_alive = 0;
+                ctx->state = STATE_SEND_RESPONSE_HEADERS;
+                return;
+        } 
         ctx->state = STATE_CHECK_CACHE;
         ctx->checkCache = 1;
         handle_check_cache(ctx);
-    } else if(strncmp(ctx->method,"POST",4) == 0) {
-        /*ctx->state = STATE_TUNNELING;
-        handle_tunnel_request(ctx);*/
     } else {
         send_error_response(ctx->client_fd,501,"Not Implemented",NULL);
         log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, "Unsupported Method");
@@ -559,7 +672,6 @@ void* handle_state_machine(void* args) {
             if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ctx->upstream_fd, &event) == -1) {
                 perror("epoll_ctl mod upstream failed");
                 ctx->state = STATE_CLOSE; 
-                free_context(ctx);
             }
         } else if(ctx->state == STATE_READ_REQUEST ||  ctx->state == STATE_SEND_RESPONSE_HEADERS || ctx->state == STATE_SEND_CACHE) {
             event.data.fd = ctx->client_fd;
@@ -571,7 +683,6 @@ void* handle_state_machine(void* args) {
             if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ctx->client_fd, &event) == -1) {
                 perror("epoll_ctl mod client failed");
                 ctx->state = STATE_CLOSE; 
-                free_context(ctx);
             }
         }
     }
@@ -726,7 +837,69 @@ void* handle_state_machine(void* args) {
     close(serverfd);
 }*/
 
-int main() {
+int resolve_origin_dns(const char* hostname,const char* port_str) {
+    strncpy(upstream_config.hostname,hostname,sizeof(upstream_config.hostname) - 1);
+
+    upstream_config.port = atoi(port_str);
+    upstream_config.is_resolved = 0;
+
+    struct addrinfo hints,*res;
+    memset(&hints,0,sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int status = getaddrinfo(hostname,port_str,&hints,&res);
+    if(status != 0) {
+        fprintf(stderr,"Startup Failure: getaddrinfo failed for host %s port %s: %s\n",hostname,port_str, gai_strerror(status));
+        return -1;
+    }
+    
+    memcpy(&upstream_config.resolved_addr,res->ai_addr,res->ai_addrlen);
+    upstream_config.resolved_addr_len = res->ai_addrlen;
+    upstream_config.is_resolved = 1;
+    
+    freeaddrinfo(res);
+    printf("Origin Server resolved. Hostname %s Port %s\n",hostname,port_str);
+    return 0;
+
+}
+
+int main(int argc,char* argv[]) {
+    
+    char hostname[256] = "127.0.0.1";
+    char port_str[16]  = "8080";
+    
+    if(argc == 1) {
+        fprintf(stderr,"use --help for usage details");
+        return 0;
+    }
+
+    for(int i = 1; i < argc; i++) {
+        if(strcmp(argv[i],"--help") == 0) {
+            fprintf(stderr,"Usage Details: ./http_proxy.exe --port <port> --origin <hostname>\n");
+            fprintf(stderr,"Example: ./http_proxy.exe 8080 127.0.0.1:8080");
+            return 0;
+        } else{
+            if(argc < 5) {
+                fprintf(stderr,"Wrong Usage. use --help for usage details");
+                return 0;
+            }
+            if(strcmp(argv[i],"--port") == 0 && i + 1 < argc) {
+                strncpy(port_str,argv[++i],sizeof(port_str) - 1);
+                port_str[sizeof(port_str) - 1] = '\0';
+
+            } else if(strcmp(argv[i],"--origin") == 0 && i + 1 < argc) {
+                strncpy(hostname,argv[++i],sizeof(hostname) - 1);
+                hostname[sizeof(hostname) - 1] = '\0';
+
+            }
+        }
+    }
+
+    if(resolve_origin_dns(hostname,port_str) == -1) {
+        return 0;
+    }
+
     struct sockaddr_storage their_addr;
     struct addrinfo hints, *res, *p;
     socklen_t sin_size;
@@ -790,6 +963,9 @@ int main() {
     printf("Proxy Server started. Initial Req ID: %" PRIu64 "\n", global_req_id);
     make_socket_non_blocking(sockfd); // Make the main listener non-blocking
     
+    server_start_time = time(NULL);
+
+    
     epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {
         perror("epoll_create1 failed");
@@ -808,7 +984,15 @@ int main() {
         exit(1);
     }
 
-    init_thread_pool(8,4096);
+    init_thread_pool(8,11000);
+
+    pthread_t telemetry_thread;
+    if (pthread_create(&telemetry_thread, NULL, telemetry_worker, NULL) != 0) {
+        perror("Failed to start telemetry daemon");
+    }
+    pthread_detach(telemetry_thread);
+    printf("[System] Telemetry daemon started.\n");
+
     while(server_running) {
 
         int n_ready = epoll_wait(epoll_fd,events,MAX_FDS,-1);
@@ -832,7 +1016,7 @@ int main() {
                             break; // We accepted all incoming connections
                         }
                         perror("accept");
-                        continue;
+                        break;
                     }
                     make_socket_non_blocking(newfd);
                     int flag = 1;

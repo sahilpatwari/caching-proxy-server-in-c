@@ -101,7 +101,7 @@ int check_rate_limit(char* client_ip) {
             return 1;
         } else {
             strncpy(target->ip,client_ip,INET6_ADDRSTRLEN - 1);
-            target->ip[INET6_ADDRSTRLEN] = '\0';
+            target->ip[INET6_ADDRSTRLEN - 1] = '\0';
             target->tokens = RATE_LIMITER_CAPACITY;
             target->last_refill = time(NULL);
             target->next = hash_table[bucket];
