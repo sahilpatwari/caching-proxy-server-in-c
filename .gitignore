@@ -62,7 +62,6 @@ cache/
 proxy.log
 
 new/
-
+benchmark/
 test.c
-
 cache_registry.bin
