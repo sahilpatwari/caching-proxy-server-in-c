@@ -34,6 +34,7 @@ typedef struct {
     int client_fd;         
     int upstream_fd;        
     uint64_t req_id;       
+    time_t cached_at;
     
     ConnectionState state;
      
