@@ -4,7 +4,8 @@
 #include<sys/socket.h>
 
 void send_error_response(int client_fd,int status_code,const char *message,const char* extra_headers) {
-    char response[1024];
+    char body[1024];
+    char response[2048];
     char *status_text;
 
     switch(status_code) {
@@ -20,18 +21,20 @@ void send_error_response(int client_fd,int status_code,const char *message,const
         case 504: status_text = "Gateway Timeout"; break;
         default:  status_text = "Error"; break;
     }
+
+    int body_len = snprintf(body,sizeof(body),"<html><body><h1>%d %s</h1><p>%s</p></body></html>",status_code,status_text,message);
     const char* headers = extra_headers ? extra_headers : "";
-    snprintf(response,sizeof(response),
+    int total_len = snprintf(response,sizeof(response),
              "HTTP/1.1 %d %s\r\n"
              "Content-Type:text/html\r\n"
-             "Content-Length:%ld\r\n"
+             "Content-Length:%d\r\n"
              "Connection:close\r\n"
              "%s"
              "\r\n"
-             "<html><body><h1>%d %s</h1><p>%s</p></body></html>",
-             status_code,status_text,strlen(message) + 50,headers,status_code,status_text,message);
+             "%s\r\n",
+             status_code,status_text,body_len,headers,body);
     
-    if(send(client_fd,response,strlen(response),MSG_NOSIGNAL) == -1) {
+    if(send(client_fd,response,total_len,MSG_NOSIGNAL) == -1) {
        perror("Failed to send error response to client");
     }
 }

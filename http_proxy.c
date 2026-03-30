@@ -29,6 +29,9 @@
 #define MAX_FDS 65536
 #define EPOLL_BATCH_SIZE 512
 #define POOL_BUCKETS 1024
+#define POOL_MAX_CONNECTIONS 12000
+#define MAX_UPSTREAM_CONNS 2000
+_Atomic int active_upstream_connections = 0;
 
 extern void abort_cache_download(char* url);
 extern int purge_cache_entry(char* url);
@@ -172,6 +175,7 @@ void stash_connection(int fd, char* hostname, int port) {
         target_host = malloc(sizeof(HostEntry));
         if(!target_host) {
             perror("malloc");
+            atomic_fetch_sub(&active_upstream_connections, 1);
             close(fd);
             pthread_mutex_unlock(&bucket->bucket_lock);
             return;
@@ -201,10 +205,49 @@ void stash_connection(int fd, char* hostname, int port) {
 }
 
 ConnectionContext* context_table[MAX_FDS];
+static ConnectionContext* context_pool_memory;
+static ConnectionContext** free_context_stack;
+int free_context_stack_top = -1;
+static pthread_mutex_t context_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void init_context_pool() {
+    context_pool_memory = calloc(POOL_MAX_CONNECTIONS,sizeof(ConnectionContext));
+    free_context_stack = malloc(POOL_MAX_CONNECTIONS * sizeof(ConnectionContext*));
+
+    if(!context_pool_memory || !free_context_stack) {
+        printf("Failed to pre-allocate RAM");
+        exit(EXIT_FAILURE);
+    }
+
+    for(int i = 0; i < POOL_MAX_CONNECTIONS; i++) {
+        free_context_stack[i] = &context_pool_memory[i];
+    }
+    free_context_stack_top = POOL_MAX_CONNECTIONS - 1;
+}
+
+void destroy_context_pool() {
+    if(context_pool_memory) free(context_pool_memory);
+    if(free_context_stack)  free(free_context_stack);
+
+    context_pool_memory = NULL;
+    free_context_stack = NULL;
+    free_context_stack_top = -1;
+}
+
 ConnectionContext* create_context(int fd) {
     if(fd >= MAX_FDS) return NULL;
-    ConnectionContext* ctx = calloc(1,sizeof(ConnectionContext));
-    if(!ctx) return NULL;
+    
+    ConnectionContext* ctx = NULL;
+    if(free_context_stack_top >= 0) {
+        pthread_mutex_lock(&context_pool_lock);
+        ctx = free_context_stack[free_context_stack_top--];
+        pthread_mutex_unlock(&context_pool_lock);
+    }
+
+    if(!ctx) {
+        ctx = calloc(1,sizeof(ConnectionContext));
+        if(!ctx) return NULL;
+    }
 
     ctx->send_mem_buf = NULL;
     ctx->send_mem_len = 0;
@@ -227,17 +270,40 @@ ConnectionContext* create_context(int fd) {
     ctx->client_fd = fd;
     ctx->upstream_fd = -1;
     ctx->file_fd = -1;
-    // GENERATE ID
     ctx->active_threads = 0;
     pthread_mutex_init(&ctx->state_lock, NULL);
     ctx->req_id = global_req_id++;
     ctx->state = STATE_READ_REQUEST;
+    
+    ctx->cached_at = 0;
     ctx->bytes_read = 0;
     ctx->write_len = 0;
     ctx->write_offset = 0;
     ctx->is_designated_downloader = 0;
     ctx->bytes_remaining = 0;
+    ctx->file_offset = 0;
     ctx->keep_alive = 1;
+    ctx->upstream_header_len = 0;
+    ctx->upstream_headers_parsed = 0;
+    ctx->cache_ttl = 0;
+    ctx->checkCache = 0;
+    ctx->upstream_content_length = 0;
+    ctx->upstream_body_downloaded = 0;
+    
+    ctx->is_chunked = 0;
+    ctx->chunk_state = 0;
+    ctx->current_chunk_size = 0;
+    ctx->current_chunk_bytes_read = 0;
+    ctx->hex_idx = 0;
+    ctx->header_overshoot_len = 0;
+    
+    ctx->read_buf[0] = '\0';
+    ctx->method[0] = '\0';
+    ctx->url[0] = '\0';
+    ctx->protocol[0] = '\0';
+    ctx->req.hostname[0] = '\0';
+    ctx->req.port = 0;
+    ctx->req.path[0] = '\0';
     context_table[fd] = ctx;
     return ctx; 
 }
@@ -254,7 +320,7 @@ void free_context(ConnectionContext* ctx) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->upstream_fd, NULL);
         
         context_table[ctx->upstream_fd] = NULL; 
-        
+        atomic_fetch_sub(&active_upstream_connections,1);
         close(ctx->upstream_fd);
         ctx->upstream_fd = -1;
     }
@@ -279,8 +345,13 @@ void free_context(ConnectionContext* ctx) {
         ctx->client_fd = -1;
     }
 
-
-    free(ctx);
+    if(free_context_stack_top < POOL_MAX_CONNECTIONS - 1) {
+        pthread_mutex_lock(&context_pool_lock);
+        free_context_stack[++free_context_stack_top] = ctx;
+        pthread_mutex_unlock(&context_pool_lock);
+    } else {
+        free(ctx);
+    }
 }
 
 int make_socket_non_blocking(int fd) {
@@ -362,6 +433,7 @@ void handle_send_upstream(ConnectionContext* ctx) {
                 context_table[ctx->upstream_fd] = NULL;
                 close(ctx->upstream_fd);
                 ctx->upstream_fd = -1;
+                atomic_fetch_sub(&active_upstream_connections, 1);
 
                 ctx->state = STATE_CONNECT_UPSTREAM;
                 handle_connect_upstream(ctx);
@@ -383,6 +455,14 @@ void handle_send_upstream(ConnectionContext* ctx) {
 
 void handle_connect_upstream(ConnectionContext* ctx) {
     
+    // Load shedding removed for robust origin benchmarking
+    /* if(atomic_load(&active_upstream_connections) >= MAX_UPSTREAM_CONNS) {
+        log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, "Load Shedding: Upstream Capacity Reached");
+        send_error_response(ctx->client_fd,503,"Service Unavailiable Retry after a while","Retry-After:5\r\n");
+        ctx->state = STATE_CLOSE;
+        return;
+    } */
+
     strncpy((ctx->req).hostname,upstream_config.hostname,sizeof((ctx->req).hostname) - 1);
     (ctx->req).port = upstream_config.port;
     strncpy((ctx->req).path, ctx->url, sizeof((ctx->req).path) - 1);
@@ -422,9 +502,9 @@ void handle_connect_upstream(ConnectionContext* ctx) {
         ctx->state = STATE_CLOSE;
         return;
     }
-    
+    atomic_fetch_add(&active_upstream_connections,1);
     make_socket_non_blocking(sockfd);
-
+   
     connect_res = connect(sockfd,(struct sockaddr*)&upstream_config.resolved_addr,upstream_config.resolved_addr_len);
     
     if(connect_res < 0 && errno != EINPROGRESS) {
@@ -687,6 +767,16 @@ void* handle_state_machine(void* args) {
         }
     }
     
+    if(ctx->state == STATE_CLOSE) {
+        if(ctx->client_fd != -1) {
+            epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->client_fd,NULL);
+        }
+
+        if(ctx->upstream_fd != -1) {
+            epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->upstream_fd,NULL);
+        }
+    }
+
     int is_closed = (ctx->state == STATE_CLOSE) ? 1 : 0;
     pthread_mutex_unlock(&ctx->state_lock);
 
@@ -919,6 +1009,7 @@ int main(int argc,char* argv[]) {
     init_rate_limiter();
     init_connection_pool();
     init_cache();
+    init_context_pool();
     init_registry();
     rehydrate_cache();
     memset(&hints,0,sizeof hints);
@@ -984,7 +1075,7 @@ int main(int argc,char* argv[]) {
         exit(1);
     }
 
-    init_thread_pool(8,11000);
+    init_thread_pool(12,65536);
 
     pthread_t telemetry_thread;
     if (pthread_create(&telemetry_thread, NULL, telemetry_worker, NULL) != 0) {
@@ -1034,6 +1125,9 @@ int main(int argc,char* argv[]) {
                     
                     if(submit_task(handle_state_machine,(void*)ctx) != 0) {
                         atomic_fetch_sub(&ctx->active_threads,1);
+
+                        ctx->state = STATE_CLOSE;
+                        free_context(ctx);
                     }
                 }
             }
@@ -1044,6 +1138,7 @@ int main(int argc,char* argv[]) {
     destroy_thread_pool(); 
     //destroy_rate_limiter(); 
     destroy_cache();
+    destroy_context_pool();
     close_log(); 
     close(epoll_fd);
     close(sockfd);

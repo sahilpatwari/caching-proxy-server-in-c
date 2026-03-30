@@ -6,7 +6,6 @@
 #include <stdatomic.h>
 #define BUFFER 8192
 
-
 struct ProxyRequest {
     char hostname[256];
     int port;
