@@ -65,3 +65,4 @@ new/
 benchmark/
 test.c
 cache_registry.bin
+proxy_env
