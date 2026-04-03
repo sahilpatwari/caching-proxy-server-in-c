@@ -34,7 +34,8 @@ typedef struct {
     int upstream_fd;        
     uint64_t req_id;       
     time_t cached_at;
-    
+    _Atomic time_t last_active;
+
     ConnectionState state;
      
     char client_ip[INET6_ADDRSTRLEN];
@@ -80,6 +81,9 @@ typedef struct {
     const char* send_mem_buf;
     long send_mem_len;
     long send_mem_offset;
+    int thread_epoll_fd;
+
+    int is_spooled_disk;
 } ConnectionContext;
 
 typedef struct ConnectionNode {

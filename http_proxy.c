@@ -31,6 +31,7 @@
 #define POOL_BUCKETS 1024
 #define POOL_MAX_CONNECTIONS 12000
 #define MAX_UPSTREAM_CONNS 2000
+#define IDLE_TIMEOUT_SEC 30
 _Atomic int active_upstream_connections = 0;
 
 extern void abort_cache_download(char* url);
@@ -65,10 +66,11 @@ static struct upstream_config {
     struct sockaddr_storage resolved_addr;
     socklen_t resolved_addr_len;
     int is_resolved;
+    pthread_rwlock_t dns_lock;
 }upstream_config;
 
 //EPOLL INSTANCE
-int epoll_fd;
+__thread int epoll_fd;
 HostBucket connection_map[POOL_BUCKETS];
 void handle_connect_upstream(ConnectionContext* ctx);
 static unsigned long hash_host(const char* hostname,int port) {
@@ -122,6 +124,7 @@ void* telemetry_worker(void* arg) {
 
     return NULL;
 }
+
 
 void init_connection_pool() {
     for (int i = 0; i < POOL_BUCKETS; i++) {
@@ -204,6 +207,41 @@ void stash_connection(int fd, char* hostname, int port) {
     return;
 }
 
+void flush_connection_pool(char* hostname,int port) {
+    int idx = hash_host(hostname,port);
+    HostBucket* bucket = &connection_map[idx];
+
+    pthread_mutex_lock(&bucket->bucket_lock);
+    HostEntry* curr_host = bucket->head;
+    while(curr_host != NULL) {
+        if(strcmp(curr_host->hostname,hostname) == 0 && curr_host->port == port) {
+            ConnectionNode* node = curr_host->fd_head;
+            int closed_count = 0;
+
+            while(node != NULL) {
+                close(node->fd);
+                atomic_fetch_sub(&active_upstream_connections,1);
+
+                ConnectionNode* temp = node;
+                node = node->next;
+                free(temp);
+                closed_count++;
+            }
+            
+            curr_host->fd_head = NULL;
+            if(closed_count > 0) {
+                char log_buf[128];
+                snprintf(log_buf,sizeof(log_buf),"Pool Flush: Closed %d staled sockets for %s",closed_count,hostname);
+                log_event(LEVEL_INFO,0,"[system]",log_buf);
+            }
+
+            break;
+        }
+        curr_host = curr_host->next_host;
+    }
+    pthread_mutex_unlock(&bucket->bucket_lock);
+}
+
 ConnectionContext* context_table[MAX_FDS];
 static ConnectionContext* context_pool_memory;
 static ConnectionContext** free_context_stack;
@@ -272,6 +310,7 @@ ConnectionContext* create_context(int fd) {
     ctx->file_fd = -1;
     ctx->active_threads = 0;
     pthread_mutex_init(&ctx->state_lock, NULL);
+    atomic_store(&ctx->last_active,time(NULL));
     ctx->req_id = global_req_id++;
     ctx->state = STATE_READ_REQUEST;
     
@@ -354,6 +393,38 @@ void free_context(ConnectionContext* ctx) {
     }
 }
 
+void* connection_reaper_worker(void* arg) {
+    while(server_running) {
+        sleep(5);
+        time_t now = time(NULL);
+        for(int i = 0; i < MAX_FDS; i++) {
+            ConnectionContext* ctx = context_table[i];
+            if(ctx != NULL) {
+                time_t last_act = atomic_load(&ctx->last_active);
+                if(last_act > 0 && (now - last_act) > IDLE_TIMEOUT_SEC) {
+                    char log_buf[128];
+                    snprintf(log_buf,sizeof(log_buf),"Reaper snipered idle connection on FD %d",ctx->client_fd);
+                    log_event(LEVEL_WARN,ctx->req_id,ctx->client_ip,log_buf);
+                    pthread_mutex_lock(&ctx->state_lock);
+                    if(ctx->state != STATE_CLOSE) {
+                        ctx->state = STATE_CLOSE;
+
+                        struct epoll_event event;
+                        memset(&event,0,sizeof(event));
+                        event.data.fd = ctx->client_fd;
+                        event.events = EPOLLOUT | EPOLLONESHOT;
+                        if(ctx->client_fd != -1) {
+                            epoll_ctl(ctx->thread_epoll_fd,EPOLL_CTL_MOD,ctx->client_fd,&event);
+                        }
+                    }
+                    pthread_mutex_unlock(&ctx->state_lock);
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
 int make_socket_non_blocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) {
@@ -381,7 +452,7 @@ void handle_send_response_headers(ConnectionContext* ctx) {
             ctx->state = STATE_CLOSE; // Client hung up early
             return;
         }
-
+        atomic_store(&ctx->last_active,time(NULL));
         ctx->write_offset += bytes_sent;
     }
     ctx->state = STATE_SEND_CACHE;
@@ -685,7 +756,8 @@ void handle_read_request(ConnectionContext* ctx) {
             ctx->state = STATE_CLOSE;
             return;
         }
-
+        
+        atomic_store(&ctx->last_active,time(NULL));
         ctx->bytes_read += n;
         ctx->read_buf[ctx->bytes_read] = '\0';
 
@@ -749,9 +821,11 @@ void* handle_state_machine(void* args) {
                 event.events = EPOLLIN | EPOLLONESHOT;
             }
             
-            if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ctx->upstream_fd, &event) == -1) {
-                perror("epoll_ctl mod upstream failed");
-                ctx->state = STATE_CLOSE; 
+            if(ctx->upstream_fd != -1) {
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ctx->upstream_fd, &event) == -1) {
+                    perror("epoll_ctl mod upstream failed");
+                    ctx->state = STATE_CLOSE; 
+                }
             }
         } else if(ctx->state == STATE_READ_REQUEST ||  ctx->state == STATE_SEND_RESPONSE_HEADERS || ctx->state == STATE_SEND_CACHE) {
             event.data.fd = ctx->client_fd;
@@ -760,9 +834,12 @@ void* handle_state_machine(void* args) {
             } else {
                 event.events = EPOLLIN | EPOLLONESHOT;
             }
-            if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ctx->client_fd, &event) == -1) {
-                perror("epoll_ctl mod client failed");
-                ctx->state = STATE_CLOSE; 
+
+            if(ctx->client_fd != -1) {
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ctx->client_fd, &event) == -1) {
+                    perror("epoll_ctl mod client failed");
+                    ctx->state = STATE_CLOSE; 
+                }
             }
         }
     }
@@ -937,21 +1014,222 @@ int resolve_origin_dns(const char* hostname,const char* port_str) {
     memset(&hints,0,sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+    
+    int max_retries = 5;
+    int retry_delay = 1;
+    for(int i = 0; i < max_retries; i++) {
+        int status = getaddrinfo(hostname,port_str,&hints,&res);
+        if(status == 0) {
+            memcpy(&upstream_config.resolved_addr,res->ai_addr,res->ai_addrlen);
+            upstream_config.resolved_addr_len = res->ai_addrlen;
+            upstream_config.is_resolved = 1;
 
-    int status = getaddrinfo(hostname,port_str,&hints,&res);
-    if(status != 0) {
-        fprintf(stderr,"Startup Failure: getaddrinfo failed for host %s port %s: %s\n",hostname,port_str, gai_strerror(status));
-        return -1;
+            freeaddrinfo(res);
+            printf("Origin Server DNS resolved. Hostname %s Port %s\n",hostname,port_str);
+            return 0;
+        }
+
+        fprintf(stderr,"[Startup] DNS Resolution Failed (%s). Retrying in %d seconds........",gai_strerror(status),retry_delay);
+        sleep(retry_delay);
+        retry_delay *= 2;
+    }
+
+    fprintf(stderr,"Failed to resolve origin server DNS even after %d tries. Shutting Down\n",max_retries);
+    return -1;
+}
+
+void* dns_refresh_worker(void* arg) {
+    char port_str[16];
+    snprintf(port_str,sizeof(port_str),"%d",upstream_config.port);
+    
+    while(server_running) {
+        sleep(60);
+
+        struct addrinfo hints,*res;
+        memset(&hints,0,sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+
+        int status = getaddrinfo(upstream_config.hostname,port_str,&hints,&res);
+        if(status == 0) {
+            int ip_changed = 0;
+            
+            pthread_rwlock_rdlock(&upstream_config.dns_lock);
+            if(upstream_config.resolved_addr.ss_family != res->ai_family) {
+                ip_changed = 1;
+            } else {
+                if(res->ai_family == AF_INET) {
+                    struct sockaddr_in* old_addr = (struct sockaddr_in*)&upstream_config.resolved_addr;
+                    struct sockaddr_in* new_addr = (struct sockaddr_in*)res->ai_addr;
+
+                    if(old_addr->sin_addr.s_addr != new_addr->sin_addr.s_addr) {
+                        ip_changed = 1;
+                    }
+                } else if(res->ai_family == AF_INET6) {
+                    struct sockaddr_in6* old_addr = (struct sockaddr_in6*)&upstream_config.resolved_addr;
+                    struct sockaddr_in6* new_addr = (struct sockaddr_in6*)res->ai_addr;
+
+                    if(memcmp(&old_addr->sin6_addr,&new_addr->sin6_addr,sizeof(struct in6_addr)) != 0) {
+                        ip_changed = 1;
+                    }
+                }
+            }
+            pthread_rwlock_unlock(&upstream_config.dns_lock);
+
+            if(ip_changed) {
+                pthread_rwlock_wrlock(&upstream_config.dns_lock);
+                memcpy(&upstream_config.resolved_addr,res->ai_addr,res->ai_addrlen);
+                upstream_config.resolved_addr_len = res->ai_addrlen;
+                pthread_rwlock_unlock(&upstream_config.dns_lock);
+
+                log_event(LEVEL_WARN,0,"[system]","DNS Shift Detected! Flushing stale connections in the connection pool");
+
+                flush_connection_pool(upstream_config.hostname,upstream_config.port);
+            }
+    
+        } else {
+            fprintf(stderr,"Failed to resolve dns of origin server");
+        }
+    }
+    return NULL;
+}
+
+void* worker_reactor_loop(void* args) {
+    int status, sockfd = -1,yes = 1;
+    struct addrinfo hints,*res,*p;
+    memset(&hints,0,sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    if((status = getaddrinfo(NULL,PORT,&hints,&res)) == -1) {
+        fprintf(stderr,"worker: getaddrinfo: %s\n",gai_strerror(status));
+        return NULL;
+    }
+
+    for(p = res;p !=  NULL; p = p->ai_next) {
+        if((sockfd = socket(p->ai_family,p->ai_socktype,p->ai_protocol)) == -1) {
+            perror("worker: socket allocation thread failed");
+            continue;
+        }
+        
+        if(setsockopt(sockfd,SOL_SOCKET, SO_REUSEADDR,&yes,sizeof(int)) == -1) {
+            perror("setsocketopt");
+            exit(1);
+        }
+
+        if(setsockopt(sockfd,SOL_SOCKET, SO_REUSEPORT,&yes,sizeof(int)) == -1) {
+            perror("setsocketopt");
+            exit(1);
+        }
+        
+        if(bind(sockfd,p->ai_addr,p->ai_addrlen) == -1) {
+            perror("worker: bind failed");
+            close(sockfd);
+            continue;
+        }
+
+        break;
     }
     
-    memcpy(&upstream_config.resolved_addr,res->ai_addr,res->ai_addrlen);
-    upstream_config.resolved_addr_len = res->ai_addrlen;
-    upstream_config.is_resolved = 1;
-    
     freeaddrinfo(res);
-    printf("Origin Server resolved. Hostname %s Port %s\n",hostname,port_str);
-    return 0;
 
+    if(p == NULL) {
+        fprintf(stderr,"worker: Couldn't bind a to a port");
+    }
+
+    if(listen(sockfd,BACKLOG) == -1) {
+        perror("worker: listen failed");
+        exit(1);
+    }
+
+    make_socket_non_blocking(sockfd); //make the main listener non-blocking
+
+    epoll_fd = epoll_create1(0);
+    if(epoll_fd == -1) {
+        perror("worker: epoll instance creation failed");
+        exit(1);
+    }
+
+    struct epoll_event event;
+    memset(&event,0,sizeof(event));
+    struct epoll_event events[EPOLL_BATCH_SIZE];
+
+    event.data.fd = sockfd;
+    event.events = EPOLLIN;
+    if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,sockfd,&event) == -1) {
+        perror("worker: epoll ctl: sockfd failed");
+        exit(1);
+    }
+    
+    while(server_running) {
+
+        int n_ready = epoll_wait(epoll_fd,events,EPOLL_BATCH_SIZE,1000);
+        if(n_ready == -1) {
+            if(errno == EINTR) {
+                continue;
+            }
+
+            perror("worker: epoll_wait failed");
+            break;
+        }
+
+        for(int i = 0; i < n_ready; i++) {
+            int currentfd = events[i].data.fd;
+            if(currentfd == sockfd) {
+                while(1) {
+                    struct sockaddr_storage their_addr;
+                    socklen_t sin_size;
+                    sin_size = sizeof their_addr;
+
+                    int newfd = accept(sockfd,(struct sockaddr*)&their_addr,&sin_size);
+                    if(newfd == -1) {
+                        if(errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break; //We have accepted all incoming connections
+                        }
+                        perror("worker: accept");
+                        break;
+                    }
+
+                    make_socket_non_blocking(newfd);
+                    int flag = 1;
+                    if(setsockopt(newfd,IPPROTO_TCP,TCP_NODELAY,&flag,sizeof(flag)) == -1) {
+                        perror("worker: setsockopt TCP_NODELAY Failed(Non-Fatal)");
+                    }
+
+                    ConnectionContext* ctx = create_context(newfd);
+                    if(ctx == NULL) {
+                        fprintf(stderr,"worker: create_context failed");
+                        close(newfd);
+                        continue;
+                    }
+
+                    ctx->thread_epoll_fd = epoll_fd;
+                    event.data.fd = newfd;
+                    event.events = EPOLLIN | EPOLLONESHOT;
+                    if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,newfd,&event) == -1) {
+                        perror("worker: epoll ctl failed adding client descriptor");
+                        ctx->state = STATE_CLOSE;
+                        free_context(ctx);
+                        close(newfd);
+                        continue;
+                    }
+                }
+            } else {
+                ConnectionContext* ctx = context_table[currentfd];
+                if(ctx != NULL) {
+                    atomic_store(&ctx->last_active,time(NULL));
+                    atomic_fetch_add(&ctx->active_threads,1);
+                    handle_state_machine(ctx);
+                } else {
+                    fprintf(stderr,"Ghost file descriptor event triggered on fd %d\n",currentfd);
+                }
+            }
+        }
+    }
+    close(epoll_fd);
+    close(sockfd);
+    return NULL;  
 }
 
 int main(int argc,char* argv[]) {
@@ -967,7 +1245,7 @@ int main(int argc,char* argv[]) {
     for(int i = 1; i < argc; i++) {
         if(strcmp(argv[i],"--help") == 0) {
             fprintf(stderr,"Usage Details: ./http_proxy.exe --port <port> --origin <hostname>\n");
-            fprintf(stderr,"Example: ./http_proxy.exe 8080 127.0.0.1:8080");
+            fprintf(stderr,"Example: ./http_proxy.exe --port 8080 --origin 127.0.0.1");
             return 0;
         } else{
             if(argc < 5) {
@@ -990,11 +1268,6 @@ int main(int argc,char* argv[]) {
         return 0;
     }
 
-    struct sockaddr_storage their_addr;
-    struct addrinfo hints, *res, *p;
-    socklen_t sin_size;
-    int status, sockfd,newfd,yes = 1;
-    
     signal(SIGPIPE, SIG_IGN); 
 
     struct sigaction sa;
@@ -1012,70 +1285,20 @@ int main(int argc,char* argv[]) {
     init_context_pool();
     init_registry();
     rehydrate_cache();
-    memset(&hints,0,sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
 
-    if((status = getaddrinfo(NULL,PORT,&hints,&res)) == -1) {
-        fprintf(stderr,"getaddrinfo: %s\n",gai_strerror(status));
-        return 1;
-    }
-
-    for(p = res;p != NULL;p = p->ai_next) {
-        if((sockfd = socket(p->ai_family,p->ai_socktype,p->ai_protocol)) == -1) {
-              perror("socket");
-              continue;
-        }
-
-         if(setsockopt(sockfd,SOL_SOCKET, SO_REUSEADDR,&yes,sizeof(int)) == -1) {
-            perror("setsocketopt");
-            exit(1);
-        }
-
-        if(bind(sockfd,p->ai_addr,p->ai_addrlen) == -1) {
-            perror("bind");
-            continue;
-        }
-        break;
-    }
-    freeaddrinfo(res);
-    if(p == NULL) {
-        fprintf(stderr,"Server couldn't bind to a specific port");
-        exit(1);
-    }
-   
-    if(listen(sockfd,BACKLOG) == -1) {
-        perror("listen");
-        exit(1);
-    }
     printf("Server is listening\n");
     global_req_id = (uint64_t)time(NULL) << 16;
     printf("Proxy Server started. Initial Req ID: %" PRIu64 "\n", global_req_id);
-    make_socket_non_blocking(sockfd); // Make the main listener non-blocking
     
     server_start_time = time(NULL);
 
-    
-    epoll_fd = epoll_create1(0);
-    if (epoll_fd == -1) {
-        perror("epoll_create1 failed");
-        exit(1);
+    int NUM_REACTORS = 8;
+    pthread_t reactors[NUM_REACTORS];
+    for(int i = 0; i < NUM_REACTORS; i++) {
+        if(pthread_create(&reactors[i],NULL,worker_reactor_loop,NULL) != 0) {
+            perror("Failed to start worker reactor thread");
+        }
     }
-
-    struct epoll_event event;
-    memset(&event,0,sizeof(event));
-    struct epoll_event events[EPOLL_BATCH_SIZE];
-
-    event.data.fd = sockfd;
-    event.events = EPOLLIN;
-    
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sockfd, &event) == -1) {
-        perror("epoll_ctl: sockfd");
-        exit(1);
-    }
-
-    init_thread_pool(12,65536);
 
     pthread_t telemetry_thread;
     if (pthread_create(&telemetry_thread, NULL, telemetry_worker, NULL) != 0) {
@@ -1084,64 +1307,27 @@ int main(int argc,char* argv[]) {
     pthread_detach(telemetry_thread);
     printf("[System] Telemetry daemon started.\n");
 
-    while(server_running) {
-
-        int n_ready = epoll_wait(epoll_fd,events,MAX_FDS,-1);
-
-        if(n_ready == -1) {
-           if (errno == EINTR) {
-                continue; 
-            }
-            perror("epoll_wait");
-            break;
-        }
-
-        for(int i = 0;i < n_ready;i++) {
-            int currentfd = events[i].data.fd;
-            if(currentfd == sockfd) {
-                while(1) {
-                    sin_size = sizeof their_addr;
-                    newfd = accept(sockfd,(struct sockaddr*)&their_addr,&sin_size);
-                    if(newfd == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break; // We accepted all incoming connections
-                        }
-                        perror("accept");
-                        break;
-                    }
-                    make_socket_non_blocking(newfd);
-                    int flag = 1;
-                    setsockopt(newfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-                    ConnectionContext* ctx = create_context(newfd);
-                    event.data.fd = newfd;
-                    event.events = EPOLLIN | EPOLLONESHOT;
-                    epoll_ctl(epoll_fd,EPOLL_CTL_ADD,newfd,&event);
-                }
-            } else {
-                ConnectionContext* ctx = context_table[currentfd];
-                
-                if(ctx != NULL) {
-                    atomic_fetch_add(&ctx->active_threads, 1);
-                    
-                    if(submit_task(handle_state_machine,(void*)ctx) != 0) {
-                        atomic_fetch_sub(&ctx->active_threads,1);
-
-                        ctx->state = STATE_CLOSE;
-                        free_context(ctx);
-                    }
-                }
-            }
-        }   
-    } 
+    pthread_t reaper_thread;
+    if(pthread_create(&reaper_thread,NULL,connection_reaper_worker,NULL) != 0) {
+        perror("Failed to start the reaper daemon");
+    }
+    pthread_detach(reaper_thread);
+    printf("[System] Idle Reaper daemon started.\n");
+    
+    pthread_t dns_thread;
+    if(pthread_create(&dns_thread,NULL,dns_refresh_worker,NULL) != 0) {
+        perror("Failed to start the dns thread");
+    }
+    printf("[System] DNS Thread started.\n");
+    for(int i = 0; i < NUM_REACTORS; i++) {
+        pthread_join(reactors[i],NULL);
+    }
 
     printf("\nInitiating graceful shutdown sequence...\n");
-    destroy_thread_pool(); 
     //destroy_rate_limiter(); 
     destroy_cache();
     destroy_context_pool();
     close_log(); 
-    close(epoll_fd);
-    close(sockfd);
 
     printf("Proxy shut down successfully. All resources freed.\n");
     return 0;

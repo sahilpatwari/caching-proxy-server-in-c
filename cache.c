@@ -26,13 +26,13 @@
 #define LARGE_FILE_THRESHOLD (1 * 1024 * 1024)    // 1MB — above this use sendfile
 #define DEFAULT_TTL          300                 // 5 minutes
 #define CACHE_BUCKETS        8192
-#define MAX_WAITERS          16384
+#define MAX_WAITERS          8192
 #define EXPIRY_INTERVAL      60                    // Seconds between expiry sweeps
 #define PREFETCH_THRESHOLD   5                     // Min accesses to qualify for prefetch
 #define PREFETCH_WINDOW      30                    // Prefetch if expiring within this many seconds
 extern _Atomic int active_upstream_connections;
 
-extern int epoll_fd;
+extern __thread int epoll_fd;
 extern ConnectionContext* context_table[];
 extern void handle_connect_upstream(ConnectionContext* ctx);
 extern void handle_send_response_headers(ConnectionContext* ctx);
@@ -272,14 +272,14 @@ int filter_headers_to_buffer(char* header_block,int block_len,char* headers,int 
         line = strtok_r(NULL,"\r\n",&save_ptr);
     }
     while(line != NULL) {
-        if(strncmp(line,"Connection:",11) == 0 || 
-           strncmp(line,"Keep-Alive:", 11) == 0 || 
-           strncmp(line,"Transfer-Encoding:", 18) == 0 || 
-           strncmp(line,"Upgrade:", 8) == 0 || 
-           strncmp(line,"Content-Length:",15) == 0 || 
-           strncmp(line,"Proxy-Connection:",17) == 0 || 
-           strncmp(line, "Via:", 4) == 0 || 
-           strncmp(line, "Age:", 4) == 0) {
+        if(strncasecmp(line,"Connection:",11) == 0 || 
+           strncasecmp(line,"Keep-Alive:", 11) == 0 || 
+           strncasecmp(line,"Transfer-Encoding:", 18) == 0 || 
+           strncasecmp(line,"Upgrade:", 8) == 0 || 
+           strncasecmp(line,"Content-Length:",15) == 0 || 
+           strncasecmp(line,"Proxy-Connection:",17) == 0 || 
+           strncasecmp(line, "Via:", 4) == 0 || 
+           strncasecmp(line, "Age:", 4) == 0) {
             line = strtok_r(NULL,"\r\n",&save_ptr);
             continue;
         }
@@ -354,10 +354,16 @@ void bypass_cache_for_waiters(char* url) {
                 pthread_mutex_lock(&waiter->state_lock);
                 if(waiter->state != STATE_CLOSE) {
                     waiter->state = STATE_CONNECT_UPSTREAM;
+
+                    struct epoll_event event;
+                    memset(&event,0,sizeof(event));
+                    event.data.fd = waiter->client_fd;
+                    event.events = EPOLLOUT | EPOLLONESHOT;
+
+                    epoll_ctl(waiter->thread_epoll_fd,EPOLL_CTL_MOD,waiter->client_fd,&event);
                 }
                 pthread_mutex_unlock(&waiter->state_lock);
-
-                submit_task(handle_state_machine,waiter);
+                atomic_fetch_sub(&waiter->active_threads,1);
             }
             return;
         }
@@ -403,10 +409,16 @@ void remove_from_cache_ram_locked(char* url, int bucket) {
                     pthread_mutex_lock(&waiter->state_lock);
                     if(waiter->state != STATE_CLOSE) {
                         waiter->state = STATE_CHECK_CACHE;
+
+                        struct epoll_event event;
+                        memset(&event,0,sizeof(event));
+                        event.data.fd = waiter->client_fd;
+                        event.events = EPOLLOUT | EPOLLONESHOT;
+
+                        epoll_ctl(waiter->thread_epoll_fd,EPOLL_CTL_MOD,waiter->client_fd,&event);
                     }
                     pthread_mutex_unlock(&waiter->state_lock);
-
-                    submit_task(handle_state_machine,waiter);
+                     atomic_fetch_sub(&waiter->active_threads,1);
                 }
 
                 pthread_rwlock_wrlock(&cache_locks[bucket]);
@@ -453,11 +465,27 @@ void abort_cache_download(char* url) {
                 ConnectionContext* waiter = temp_waiters[i];
                 pthread_mutex_lock(&waiter->state_lock);
                 if(waiter->state != STATE_CLOSE) {
-                    send_error_response(waiter->client_fd, 502, "Bad Gateway","Upstream server failed to provide the file.");
-                    waiter->state = STATE_CLOSE;
+                    waiter->write_len = snprintf(waiter->write_buf,sizeof(waiter->write_buf),
+                    "HTTP/1.1 502 Bad Gateway\r\n"
+                    "Content-Type:text/plain\r\n"
+                    "Connection:close\r\n"
+                    "\r\n"
+                    "Upstream Server failed to provide the file");
+
+                    waiter->write_offset = 0;
+                    waiter->keep_alive = 0;
+
+                    waiter->state = STATE_SEND_RESPONSE_HEADERS;
+
+                    struct epoll_event event;
+                    memset(&event,0,sizeof(event));
+                    event.data.fd = waiter->client_fd;
+                    event.events = EPOLLOUT | EPOLLONESHOT;
+
+                    epoll_ctl(waiter->thread_epoll_fd,EPOLL_CTL_MOD,waiter->client_fd,&event);
                 }
                 pthread_mutex_unlock(&waiter->state_lock);
-                submit_task(handle_state_machine,waiter);
+                atomic_fetch_sub(&waiter->active_threads,1);
             }
 
             char cache_file[256];
@@ -530,9 +558,16 @@ int add_to_cache_ram(ConnectionContext* ctx,char* url,time_t expires_at,time_t c
                 pthread_mutex_lock(&waiter->state_lock);
                 if(waiter->state != STATE_CLOSE) {
                     waiter->state = STATE_CHECK_CACHE;
+
+                    struct epoll_event event;
+                    memset(&event,0,sizeof(event));
+                    event.data.fd = waiter->client_fd;
+                    event.events = EPOLLOUT | EPOLLONESHOT;
+
+                    epoll_ctl(waiter->thread_epoll_fd,EPOLL_CTL_MOD,waiter->client_fd,&event);
                 }
                 pthread_mutex_unlock(&waiter->state_lock);
-                submit_task(handle_state_machine,waiter);
+                atomic_fetch_sub(&waiter->active_threads,1);
             }
             return 1;
         }
@@ -589,6 +624,7 @@ int check_cache_ram(ConnectionContext* ctx) {
                         ctx->send_mem_offset = current->response_len - current->body_size;
                         ctx->cached_at = current->cached_at;
                         atomic_store(&current->last_accessed,time(NULL));
+                        pthread_rwlock_unlock(&cache_locks[bucket]);
                         atomic_fetch_add(&metric_cache_hits,1);
                         return 1; // Cache Hit
                 } else {
@@ -758,6 +794,7 @@ void handle_send_cache(ConnectionContext *ctx) {
                 ctx->state = STATE_CLOSE;
                 return;
             } 
+            atomic_store(&ctx->last_active,time(NULL));
             ctx->send_mem_offset += bytes_sent;
         }
         int cork = 0;
@@ -786,6 +823,7 @@ void handle_send_cache(ConnectionContext *ctx) {
                 ctx->state = STATE_CLOSE;
                 return;
             }
+            atomic_store(&ctx->last_active,time(NULL));
             ctx->bytes_remaining -= bytes_sent;
         }
 
@@ -852,15 +890,16 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
                 upstream_dropped = 1;
                 break;
             }
+            atomic_store(&ctx->last_active,time(NULL));
             ctx->upstream_header_len += n;
             ctx->upstream_header_buf[ctx->upstream_header_len] = '\0';
             char* body_ptr = strstr(ctx->upstream_header_buf,"\r\n\r\n");
             if(body_ptr != NULL) {
                 body_ptr += 4;
-                char* cc_length = strstr(ctx->upstream_header_buf,"Content-Length:");
+                char* cc_length = strcasestr(ctx->upstream_header_buf,"Content-Length:");
                 if(cc_length) ctx->upstream_content_length = atoi(cc_length + 15);
                 
-                char* te_header = strstr(ctx->upstream_header_buf,"Transfer-Encoding:");
+                char* te_header = strcasestr(ctx->upstream_header_buf,"Transfer-Encoding:");
                 if(te_header && strstr(te_header,"chunked")) {
                     ctx->is_chunked = 1;
                     ctx->chunk_state = 0;
@@ -875,13 +914,20 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
                 ctx->cache_ttl = parse_cache_policy(ctx->upstream_header_buf);
                 
                 if(ctx->cache_ttl <= 0) {
-                    ctx->file_fd = memfd_create("non-cacheable-stream",0);
+                    if(ctx->upstream_content_length > MAX_CACHE_MEM) {
+                        char cache_file[256],temp_file[300];
+                        get_cache_filename(ctx->url,cache_file);
+                        snprintf(temp_file,sizeof(temp_file),"%s.tmp.%d",cache_file,ctx->client_fd);
+                        ctx->file_fd = open(temp_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    } else {
+                        ctx->file_fd = memfd_create("non-cacheable-stream",0);
 
-                    if(ctx->file_fd < 0) {
-                        FILE* temp = tmpfile();
-                        if(temp) {
-                            ctx->file_fd = dup(fileno(temp));
-                            fclose(temp);
+                        if(ctx->file_fd < 0) {
+                            FILE* temp = tmpfile();
+                            if(temp) {
+                                ctx->file_fd = dup(fileno(temp));
+                                fclose(temp);
+                            }
                         }
                     }
                 } else {
@@ -936,6 +982,7 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
                     upstream_dropped = 1;
                     break;
                 }
+                atomic_store(&ctx->last_active,time(NULL));
             }
             
             if(ctx->is_chunked) {
@@ -973,6 +1020,53 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
                         ctx->current_chunk_bytes_read += write_len;
                         ctx->upstream_body_downloaded += write_len;
                         i += write_len;
+                        
+                        if(ctx->cache_ttl <= 0 && !ctx->is_spooled_disk) {
+                            if((ctx->upstream_header_len + ctx->upstream_body_downloaded) > MAX_CACHE_MEM) {
+                                char cache_file[256],temp_file[300];
+                                get_cache_filename(ctx->url,cache_file);
+                                snprintf(temp_file,sizeof(temp_file),"%s.tmp.%d",cache_file,ctx->client_fd);
+                                
+                                char log_buf[128];
+                                snprintf(log_buf,sizeof(log_buf),"Large File Requested Switching to disk transfer");
+                                log_event(LEVEL_INFO,ctx->req_id,ctx->client_ip,log_buf);
+
+                                int physical_fd = open(temp_file,O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                                if(physical_fd >= 0) { 
+                                    unlink(temp_file);
+                                    
+                                    lseek(ctx->file_fd,0,SEEK_SET);
+                                    char copy_buffer[BUFFER];
+                                    long bytes_r = 0;
+                                    int io_error = 0;
+                                    while((bytes_r = read(ctx->file_fd,copy_buffer,sizeof(copy_buffer))) > 0) {
+                                        if(write(physical_fd,copy_buffer,bytes_r) != bytes_r) {
+                                            io_error = 1;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    if(bytes_r < 0) {
+                                        io_error = 1;
+                                    }
+
+                                    if(io_error) {
+                                        char log_buf[128];
+                                        snprintf(log_buf,sizeof(log_buf),"I/O Error while switching to disk transfer");
+                                        log_event(LEVEL_ERROR,ctx->req_id,ctx->client_ip,log_buf);
+                                        
+                                        close(physical_fd);
+                                        ctx->state = STATE_CLOSE;
+                                        return;
+                                    }
+
+                                    close(ctx->file_fd);
+                                    ctx->file_fd = physical_fd;
+                                    ctx->is_spooled_disk = 1;
+                                }
+                            }
+                        }
+
                         if(ctx->current_chunk_bytes_read == ctx->current_chunk_size) {
                             ctx->chunk_state = 2;
                         }
@@ -1004,6 +1098,14 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
     
     epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->upstream_fd,NULL);
     context_table[ctx->upstream_fd] = NULL;
+    
+    if(upstream_dropped) {
+        atomic_fetch_sub(&active_upstream_connections,1);
+        close(ctx->upstream_fd);
+    } else {
+        stash_connection(ctx->upstream_fd,(ctx->req).hostname,(ctx->req).port);
+    }
+    ctx->upstream_fd = -1;
 
     char cache_file[256],temp_file[300];
     get_cache_filename(ctx->url,cache_file);
@@ -1019,13 +1121,6 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
         return;
     }
 
-    if(upstream_dropped) {
-        atomic_fetch_sub(&active_upstream_connections,1);
-        close(ctx->upstream_fd);
-    } else {
-        stash_connection(ctx->upstream_fd,(ctx->req).hostname,(ctx->req).port);
-    }
-    ctx->upstream_fd = -1;
     
     if(ctx->upstream_content_length > 0 && ctx->upstream_body_downloaded < ctx->upstream_content_length) {
         close(ctx->file_fd);
