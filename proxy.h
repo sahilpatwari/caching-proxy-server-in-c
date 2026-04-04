@@ -84,6 +84,8 @@ typedef struct {
     int thread_epoll_fd;
 
     int is_spooled_disk;
+
+    struct timeval upstream_send_time;
 } ConnectionContext;
 
 typedef struct ConnectionNode {

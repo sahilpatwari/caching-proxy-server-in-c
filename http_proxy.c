@@ -34,6 +34,15 @@
 #define IDLE_TIMEOUT_SEC 30
 _Atomic int active_upstream_connections = 0;
 
+_Atomic uint64_t global_upstream_latency_us = 50000;
+#define LATENCY_UPSTREAM_THRESHOLD 1500000
+
+_Atomic time_t circuit_cooldown_until = 0;
+#define COOLDOWN_SEC 5
+
+_Atomic int consecutive_upstream_errors = 0;
+#define MAX_CONSECUTIVE_ERRORS 20
+
 extern void abort_cache_download(char* url);
 extern int purge_cache_entry(char* url);
 // ATOMIC REQUEST ID COUNTER
@@ -367,14 +376,6 @@ void free_context(ConnectionContext* ctx) {
     if (ctx->file_fd != -1) {
         close(ctx->file_fd);
         ctx->file_fd = -1;
-
-        if(ctx->state == STATE_FETCH_UPSTREAM) {
-            char cache_file[256],temp_file[300];
-            get_cache_filename(ctx->url,cache_file);
-            snprintf(temp_file,sizeof(temp_file),"cache/%s.tmp.%d",cache_file,ctx->client_fd);
-
-            unlink(temp_file);
-        }
     }
 
     if (ctx->client_fd != -1) {
@@ -402,9 +403,17 @@ void* connection_reaper_worker(void* arg) {
             if(ctx != NULL) {
                 time_t last_act = atomic_load(&ctx->last_active);
                 if(last_act > 0 && (now - last_act) > IDLE_TIMEOUT_SEC) {
-                    char log_buf[128];
-                    snprintf(log_buf,sizeof(log_buf),"Reaper snipered idle connection on FD %d",ctx->client_fd);
-                    log_event(LEVEL_WARN,ctx->req_id,ctx->client_ip,log_buf);
+                    if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM || ctx->state == STATE_FETCH_UPSTREAM) {
+                        int current_errors = atomic_fetch_add(&consecutive_upstream_errors,1) + 1;
+                        char log_buf[128];
+                        snprintf(log_buf,sizeof(log_buf),"Reaper. Origin Timed Out. Strike: %d/%d",current_errors,MAX_CONSECUTIVE_ERRORS);
+                        log_event(LEVEL_WARN,ctx->req_id,ctx->client_ip,log_buf);
+                    } else {
+                        char log_buf[128];
+                        snprintf(log_buf,sizeof(log_buf),"Reaper snipered idle connection on FD %d",ctx->client_fd);
+                        log_event(LEVEL_WARN,ctx->req_id,ctx->client_ip,log_buf);
+                    }
+
                     pthread_mutex_lock(&ctx->state_lock);
                     if(ctx->state != STATE_CLOSE) {
                         ctx->state = STATE_CLOSE;
@@ -500,6 +509,12 @@ void handle_send_upstream(ConnectionContext* ctx) {
                 return;
             }
             if(errno == EPIPE || errno == ECONNRESET) {
+
+                int current_errors = atomic_fetch_add(&consecutive_upstream_errors, 1) + 1;
+                char log_buf[128];
+                snprintf(log_buf, sizeof(log_buf), "Origin dropped connection during send(). Strike: %d/%d", current_errors, MAX_CONSECUTIVE_ERRORS);
+                log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, log_buf);
+
                 epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->upstream_fd,NULL);
                 context_table[ctx->upstream_fd] = NULL;
                 close(ctx->upstream_fd);
@@ -520,19 +535,42 @@ void handle_send_upstream(ConnectionContext* ctx) {
 
         ctx->write_offset += bytes_sent;
     }
+    gettimeofday(&ctx->upstream_send_time,NULL);
+
     ctx->state = STATE_FETCH_UPSTREAM;
     return;
 }
 
 void handle_connect_upstream(ConnectionContext* ctx) {
     
-    // Load shedding removed for robust origin benchmarking
-    /* if(atomic_load(&active_upstream_connections) >= MAX_UPSTREAM_CONNS) {
-        log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, "Load Shedding: Upstream Capacity Reached");
-        send_error_response(ctx->client_fd,503,"Service Unavailiable Retry after a while","Retry-After:5\r\n");
-        ctx->state = STATE_CLOSE;
+    uint64_t current_latency_us = atomic_load(&global_upstream_latency_us);
+    int current_errors = atomic_load(&consecutive_upstream_errors);
+    time_t now = time(NULL);
+    time_t cooldown = atomic_load(&circuit_cooldown_until);
+
+    if(now < cooldown) {
+        ctx->write_len = snprintf(ctx->write_buf, sizeof(ctx->write_buf),
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: text/plain\r\n"
+            "Retry-After: 5\r\n"
+            "Connection: close\r\n"
+            "Content-Length: 64\r\n"
+            "\r\n"
+            "Origin server is experiencing high latency. Please retry later.");
+            
+        ctx->write_offset = 0;
+        ctx->keep_alive = 0;
+        ctx->state = STATE_SEND_RESPONSE_HEADERS;
         return;
-    } */
+    }
+    
+    if(current_latency_us > LATENCY_UPSTREAM_THRESHOLD || current_errors > MAX_CONSECUTIVE_ERRORS) {
+        atomic_store(&circuit_cooldown_until,now + COOLDOWN_SEC);
+
+        char log_buf[256];
+        snprintf(log_buf, sizeof(log_buf), "Circuit Breaker: HALF-OPEN Probe. (EMA: %.2f ms | Errors: %d)", current_latency_us / 1000.0, current_errors);
+        log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, log_buf);
+    }
 
     strncpy((ctx->req).hostname,upstream_config.hostname,sizeof((ctx->req).hostname) - 1);
     (ctx->req).port = upstream_config.port;
@@ -559,6 +597,7 @@ void handle_connect_upstream(ConnectionContext* ctx) {
         return;
     }
     
+    pthread_rwlock_rdlock(&upstream_config.dns_lock);
     if(!upstream_config.is_resolved) {
         fprintf(stderr, "Proxy Error: Upstream DNS never resolved at startup!\n");
         send_error_response(ctx->client_fd, 502, "Bad Gateway (DNS)", NULL);
@@ -578,6 +617,7 @@ void handle_connect_upstream(ConnectionContext* ctx) {
    
     connect_res = connect(sockfd,(struct sockaddr*)&upstream_config.resolved_addr,upstream_config.resolved_addr_len);
     
+    pthread_rwlock_unlock(&upstream_config.dns_lock);
     if(connect_res < 0 && errno != EINPROGRESS) {
         close(sockfd);
         sockfd = -1;
@@ -620,7 +660,10 @@ void handle_wait_connect(ConnectionContext *ctx) {
     }
 
     if (error != 0) {
-        fprintf(stderr, "Upstream connection failed: %s\n", strerror(error));
+        int current_errors = atomic_fetch_add(&consecutive_upstream_errors,1) + 1;
+        char log_buf[128];
+        snprintf(log_buf,sizeof(log_buf),"Upstream Connection Failed (%s). Strike: %d / %d",strerror(error),current_errors,MAX_CONSECUTIVE_ERRORS);
+        log_event(LEVEL_WARN,ctx->req_id,ctx->client_ip,log_buf);
         send_error_response(ctx->client_fd, 502, "Bad Gateway", NULL);
         ctx->state = STATE_CLOSE;
         return;
@@ -1314,6 +1357,7 @@ int main(int argc,char* argv[]) {
     pthread_detach(reaper_thread);
     printf("[System] Idle Reaper daemon started.\n");
     
+    pthread_rwlock_init(&upstream_config.dns_lock,NULL);
     pthread_t dns_thread;
     if(pthread_create(&dns_thread,NULL,dns_refresh_worker,NULL) != 0) {
         perror("Failed to start the dns thread");

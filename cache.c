@@ -41,6 +41,8 @@ extern void stash_connection(int fd,char* hostname,int port);
 extern _Atomic uint64_t metric_cache_hits;
 extern _Atomic uint64_t metric_cache_misses;
 
+extern _Atomic uint64_t global_upstream_latency_us;
+extern _Atomic int consecutive_upstream_errors;
 static FILE* registry_file = NULL;
 static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -884,12 +886,35 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
 
             if(n < 0) {
                 if(errno == EWOULDBLOCK || errno == EAGAIN) return;
+
+                int current_errors = atomic_fetch_add(&consecutive_upstream_errors, 1) + 1;
+                log_event(LEVEL_ERROR, ctx->req_id, ctx->client_ip, "Origin recv() error. Strike issued.");
+
                 ctx->state = STATE_CLOSE;
                 return;
             } else if(n == 0) {
+
+                if (ctx->upstream_headers_parsed == 0) {
+                    int current_errors = atomic_fetch_add(&consecutive_upstream_errors, 1) + 1;
+                    log_event(LEVEL_ERROR, ctx->req_id, ctx->client_ip, "Origin hung up early. Strike issued.");
+                }
+
                 upstream_dropped = 1;
                 break;
             }
+
+            if(ctx->upstream_header_len == 0 && n > 0) {
+                struct timeval now;
+                gettimeofday(&now,NULL);
+                
+                atomic_store(&consecutive_upstream_errors,0);
+                uint64_t time_elapsed_us = (now.tv_sec - ctx->upstream_send_time.tv_sec) * 1000000ULL + (now.tv_usec - ctx->upstream_send_time.tv_usec);
+
+                uint64_t current_ema = atomic_load(&global_upstream_latency_us);
+                uint64_t new_ema = (current_ema * 9 + time_elapsed_us) / 10;
+                atomic_store(&global_upstream_latency_us,new_ema);
+            }
+
             atomic_store(&ctx->last_active,time(NULL));
             ctx->upstream_header_len += n;
             ctx->upstream_header_buf[ctx->upstream_header_len] = '\0';
