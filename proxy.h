@@ -86,6 +86,8 @@ typedef struct {
     int is_spooled_disk;
 
     struct timeval upstream_send_time;
+
+    void* cache_ref;
 } ConnectionContext;
 
 typedef struct ConnectionNode {

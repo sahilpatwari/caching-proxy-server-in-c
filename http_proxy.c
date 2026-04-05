@@ -45,6 +45,7 @@ _Atomic int consecutive_upstream_errors = 0;
 
 extern void abort_cache_download(char* url);
 extern int purge_cache_entry(char* url);
+extern void release_cache_ref(void* ref);
 // ATOMIC REQUEST ID COUNTER
 static _Atomic uint64_t global_req_id = 0;
 
@@ -64,7 +65,7 @@ _Atomic uint64_t metric_total_requests = 0;
 _Atomic uint64_t metric_current_rps = 0;
 
 // System Level: Hardware Metrics
-_Atomic double metric_cpu_usage = 0.0;
+_Atomic uint64_t metric_cpu_usage = 0;
 _Atomic long metric_memory_rss_kb = 0;
 extern long total_cache_memory;
 time_t server_start_time;
@@ -107,7 +108,7 @@ void* telemetry_worker(void* arg) {
             if (last_cpu_time > 0.0) {
                 // If it consumed 0.5 seconds of CPU time in the last 1.0 wall-clock seconds, that is 50% CPU.
                 // Across 12 cores, max is 1200%
-                metric_cpu_usage = (current_cpu - last_cpu_time) * 100.0;
+                metric_cpu_usage = (uint64_t)(current_cpu - last_cpu_time) * 10000.0;
             }
             last_cpu_time = current_cpu;
         }
@@ -251,7 +252,7 @@ void flush_connection_pool(char* hostname,int port) {
     pthread_mutex_unlock(&bucket->bucket_lock);
 }
 
-ConnectionContext* context_table[MAX_FDS];
+_Atomic(ConnectionContext*) context_table[MAX_FDS];
 static ConnectionContext* context_pool_memory;
 static ConnectionContext** free_context_stack;
 int free_context_stack_top = -1;
@@ -285,12 +286,12 @@ ConnectionContext* create_context(int fd) {
     if(fd >= MAX_FDS) return NULL;
     
     ConnectionContext* ctx = NULL;
+    pthread_mutex_lock(&context_pool_lock);
     if(free_context_stack_top >= 0) {
-        pthread_mutex_lock(&context_pool_lock);
         ctx = free_context_stack[free_context_stack_top--];
-        pthread_mutex_unlock(&context_pool_lock);
     }
-
+    pthread_mutex_unlock(&context_pool_lock);
+    
     if(!ctx) {
         ctx = calloc(1,sizeof(ConnectionContext));
         if(!ctx) return NULL;
@@ -320,7 +321,7 @@ ConnectionContext* create_context(int fd) {
     ctx->active_threads = 0;
     pthread_mutex_init(&ctx->state_lock, NULL);
     atomic_store(&ctx->last_active,time(NULL));
-    ctx->req_id = global_req_id++;
+    ctx->req_id = atomic_fetch_add(&global_req_id,1);
     ctx->state = STATE_READ_REQUEST;
     
     ctx->cached_at = 0;
@@ -337,7 +338,8 @@ ConnectionContext* create_context(int fd) {
     ctx->checkCache = 0;
     ctx->upstream_content_length = 0;
     ctx->upstream_body_downloaded = 0;
-    
+    ctx->cache_ref = NULL;
+
     ctx->is_chunked = 0;
     ctx->chunk_state = 0;
     ctx->current_chunk_size = 0;
@@ -352,7 +354,7 @@ ConnectionContext* create_context(int fd) {
     ctx->req.hostname[0] = '\0';
     ctx->req.port = 0;
     ctx->req.path[0] = '\0';
-    context_table[fd] = ctx;
+    atomic_store(&context_table[fd],ctx);
     return ctx; 
 }
 
@@ -363,11 +365,14 @@ void free_context(ConnectionContext* ctx) {
         abort_cache_download(ctx->url);
         ctx->is_designated_downloader = 0;
     }
+    
+    release_cache_ref(ctx->cache_ref);
+    ctx->cache_ref = NULL;
 
     if (ctx->upstream_fd != -1) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->upstream_fd, NULL);
         
-        context_table[ctx->upstream_fd] = NULL; 
+        atomic_store(&context_table[ctx->upstream_fd],NULL); 
         atomic_fetch_sub(&active_upstream_connections,1);
         close(ctx->upstream_fd);
         ctx->upstream_fd = -1;
@@ -380,18 +385,20 @@ void free_context(ConnectionContext* ctx) {
 
     if (ctx->client_fd != -1) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->client_fd, NULL);
-        context_table[ctx->client_fd] = NULL;
+        atomic_store(&context_table[ctx->client_fd],NULL);
         close(ctx->client_fd);
         ctx->client_fd = -1;
     }
-
+    
+    pthread_mutex_lock(&context_pool_lock);
     if(free_context_stack_top < POOL_MAX_CONNECTIONS - 1) {
-        pthread_mutex_lock(&context_pool_lock);
         free_context_stack[++free_context_stack_top] = ctx;
         pthread_mutex_unlock(&context_pool_lock);
-    } else {
-        free(ctx);
-    }
+        return;
+    } 
+    pthread_mutex_unlock(&context_pool_lock);
+
+    free(ctx);
 }
 
 void* connection_reaper_worker(void* arg) {
@@ -399,23 +406,24 @@ void* connection_reaper_worker(void* arg) {
         sleep(5);
         time_t now = time(NULL);
         for(int i = 0; i < MAX_FDS; i++) {
-            ConnectionContext* ctx = context_table[i];
+            ConnectionContext* ctx = atomic_load(&context_table[i]);
             if(ctx != NULL) {
                 time_t last_act = atomic_load(&ctx->last_active);
                 if(last_act > 0 && (now - last_act) > IDLE_TIMEOUT_SEC) {
-                    if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM || ctx->state == STATE_FETCH_UPSTREAM) {
-                        int current_errors = atomic_fetch_add(&consecutive_upstream_errors,1) + 1;
-                        char log_buf[128];
-                        snprintf(log_buf,sizeof(log_buf),"Reaper. Origin Timed Out. Strike: %d/%d",current_errors,MAX_CONSECUTIVE_ERRORS);
-                        log_event(LEVEL_WARN,ctx->req_id,ctx->client_ip,log_buf);
-                    } else {
-                        char log_buf[128];
-                        snprintf(log_buf,sizeof(log_buf),"Reaper snipered idle connection on FD %d",ctx->client_fd);
-                        log_event(LEVEL_WARN,ctx->req_id,ctx->client_ip,log_buf);
-                    }
-
                     pthread_mutex_lock(&ctx->state_lock);
                     if(ctx->state != STATE_CLOSE) {
+                        if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM || ctx->state == STATE_FETCH_UPSTREAM) {
+                            int current_errors = atomic_fetch_add(&consecutive_upstream_errors,1) + 1;
+                            char log_buf[128];
+                            snprintf(log_buf,sizeof(log_buf),"Reaper. Origin Timed Out. Strike: %d/%d",current_errors,MAX_CONSECUTIVE_ERRORS);
+                            log_event(LEVEL_WARN,ctx->req_id,ctx->client_ip,log_buf);
+                        } else {
+                            char log_buf[128];
+                            snprintf(log_buf,sizeof(log_buf),"Reaper snipered idle connection on FD %d",ctx->client_fd);
+                            log_event(LEVEL_WARN,ctx->req_id,ctx->client_ip,log_buf);
+                        }
+
+                        
                         ctx->state = STATE_CLOSE;
 
                         struct epoll_event event;
@@ -516,7 +524,7 @@ void handle_send_upstream(ConnectionContext* ctx) {
                 log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, log_buf);
 
                 epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->upstream_fd,NULL);
-                context_table[ctx->upstream_fd] = NULL;
+                atomic_store(&context_table[ctx->upstream_fd],NULL);
                 close(ctx->upstream_fd);
                 ctx->upstream_fd = -1;
                 atomic_fetch_sub(&active_upstream_connections, 1);
@@ -580,7 +588,7 @@ void handle_connect_upstream(ConnectionContext* ctx) {
     int warmfd = get_pool_connection((ctx->req).hostname,(ctx->req).port);
     if(warmfd != -1) {
         ctx->upstream_fd = warmfd;
-        context_table[warmfd] = ctx;
+        atomic_store(&context_table[warmfd],ctx);
 
         struct epoll_event event;
         event.data.fd = warmfd;
@@ -628,7 +636,7 @@ void handle_connect_upstream(ConnectionContext* ctx) {
     }
     
     ctx->upstream_fd = sockfd;
-    context_table[sockfd] = ctx;
+    atomic_store(&context_table[sockfd],ctx);
     
     struct epoll_event event;
     memset(&event,0,sizeof(event));
@@ -741,6 +749,7 @@ void handle_parse_request(ConnectionContext* ctx) {
             uint64_t total = hits + misses;
             double hit_ratio = total > 0 ? ((double)hits / total)* 100.0 : 0.0;
             long uptime = time(NULL) - server_start_time;
+            uint64_t cpu = atomic_load(&metric_cpu_usage);
 
             ctx->write_len = snprintf(ctx->write_buf, sizeof(ctx->write_buf),
                 "HTTP/1.1 200 OK\r\n"
@@ -765,7 +774,7 @@ void handle_parse_request(ConnectionContext* ctx) {
                 "}", 
                 uptime, metric_current_rps, metric_total_requests, 
                 hit_ratio, hits, misses, total_cache_memory,
-                metric_cpu_usage, metric_memory_rss_kb);
+                cpu / 100.0, metric_memory_rss_kb);
                 
                 ctx->bytes_remaining = 0;
                 ctx->file_fd = -1;
@@ -1259,7 +1268,7 @@ void* worker_reactor_loop(void* args) {
                     }
                 }
             } else {
-                ConnectionContext* ctx = context_table[currentfd];
+                ConnectionContext* ctx = atomic_load(&context_table[currentfd]);
                 if(ctx != NULL) {
                     atomic_store(&ctx->last_active,time(NULL));
                     atomic_fetch_add(&ctx->active_threads,1);
@@ -1279,7 +1288,7 @@ int main(int argc,char* argv[]) {
     
     char hostname[256] = "127.0.0.1";
     char port_str[16]  = "8080";
-    
+
     if(argc == 1) {
         fprintf(stderr,"use --help for usage details");
         return 0;

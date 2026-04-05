@@ -83,7 +83,8 @@ void log_event(LogLevel level, uint64_t req_id, const char *client_ip,const char
     if (level < current_level) return;
 
     time_t now = time(NULL);
-    struct tm* t = localtime(&now);
+    struct tm t_storage;
+    struct tm* t = localtime_r(&now,&t_storage);
     char time_str[64];
     strftime(time_str,sizeof(time_str),"%Y-%m-%d %H:%M:%S",t);
     

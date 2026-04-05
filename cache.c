@@ -33,7 +33,7 @@
 extern _Atomic int active_upstream_connections;
 
 extern __thread int epoll_fd;
-extern ConnectionContext* context_table[];
+extern _Atomic(ConnectionContext*) context_table[];
 extern void handle_connect_upstream(ConnectionContext* ctx);
 extern void handle_send_response_headers(ConnectionContext* ctx);
 extern void stash_connection(int fd,char* hostname,int port);
@@ -46,6 +46,7 @@ extern _Atomic int consecutive_upstream_errors;
 static FILE* registry_file = NULL;
 static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
+void* expiry_worker(void*);
 typedef struct {
     char action;
     char url[512];
@@ -112,6 +113,8 @@ typedef struct CacheNode {
     struct CacheNode* next;
 
     long memory_usage;
+
+    _Atomic int ref_count;
 }CacheNode;
 
 static CacheNode* cache_table[CACHE_BUCKETS];
@@ -147,7 +150,7 @@ static void approximate_evict_if_needed() {
             pthread_rwlock_rdlock(&cache_locks[bucket]);
             CacheNode* current = cache_table[bucket];
             while(current) {
-                if(!current->is_downloading && current->response != NULL) {
+                if(!current->is_downloading && current->response != NULL && current->ref_count == 0) {
                     time_t acc = atomic_load(&current->last_accessed);
                     if(acc < oldest_time) {
                         oldest_time = acc;
@@ -160,7 +163,7 @@ static void approximate_evict_if_needed() {
            pthread_rwlock_unlock(&cache_locks[bucket]);
         }
 
-        if(best_victim != NULL && best_bucket != -1) {
+        if(best_victim != NULL && best_bucket != -1 && !best_victim->is_downloading && best_victim->ref_count == 0) {
             pthread_rwlock_wrlock(&cache_locks[best_bucket]);
             int found = 0;
             CacheNode* current = cache_table[best_bucket];
@@ -195,13 +198,13 @@ void init_cache() {
     atomic_store(&total_cache_memory,0);
     
     cache_running = 1;
-    //pthread_create(&expiry_thread,NULL,expiry_worker,NULL);
+    pthread_create(&expiry_thread,NULL,expiry_worker,NULL);
 }
 
 void destroy_cache() {
     cache_running = 0;
-    //pthread_cancel(expiry_thread);
-    //pthread_join(&expiry_thread,NULL);
+    pthread_cancel(expiry_thread);
+    pthread_join(expiry_thread,NULL);
 
     for(int i = 0; i < CACHE_BUCKETS; i++) {
         pthread_rwlock_wrlock(&cache_locks[i]);
@@ -227,7 +230,117 @@ void get_cache_filename(char* url,char* buffer) {
     sprintf(buffer,"cache/%lu",hash);
 }
 
+void acquire_cache_ref(void* ref) {
+    if(ref == NULL) return;
+    CacheNode* node = (CacheNode*)ref;
+    atomic_fetch_add(&node->ref_count,1);
+}
 
+void release_cache_ref(void* ref) {
+    if(ref == NULL) return;
+    CacheNode* node = (CacheNode*)ref;
+    atomic_fetch_sub(&node->ref_count,1);
+    
+}
+void compact_registry() {
+    pthread_mutex_lock(&registry_lock);
+
+    if(!registry_file) {
+        pthread_mutex_unlock(&registry_lock);
+        return;
+    }
+
+    fclose(registry_file);
+    
+    FILE* old = fopen("cache_registry.bin","rb");
+    FILE* new = fopen("cache_registry.tmp","wb");
+    
+    if(!old || !new) {
+        if(old) fclose(old);
+        if(new) {fclose(new); unlink("cache_registry.tmp"); }
+
+        registry_file = fopen("cache_registry.bin","ab+");
+        pthread_mutex_unlock(&registry_lock);
+        return;
+    }
+    
+    time_t now = time(NULL);
+    RegistryRecord rec;
+    int write_error = 0;
+    while(fread(&rec,sizeof(RegistryRecord),1,old) == 1) {
+        if(rec.action == 'A' && rec.expires_at > now) {
+            if(fwrite(&rec,sizeof(RegistryRecord),1,new) != 1) {
+                write_error = 1;
+                break;
+            }
+        }
+    }
+
+    if(ferror(old)) {
+        write_error = 1;
+    }
+
+    if(!write_error && fflush(new) != 0) {
+        write_error = 1;
+    }
+
+    fclose(old);
+    fclose(new);
+
+    if(write_error) {
+        unlink("cache_registry.tmp");
+        log_event(LEVEL_ERROR,0,"[system]","Registry Compaction failed due to write error");
+    } else {
+        rename("cache_registry.tmp","cache_registry.bin");
+    }
+
+    registry_file = fopen("cache_registry.bin","ab+");
+    pthread_mutex_unlock(&registry_lock);
+}
+
+void* expiry_worker(void* arg) {
+    while(cache_running) {
+        sleep(EXPIRY_INTERVAL);
+
+        for(int i = 0; i < CACHE_BUCKETS; i++) {
+            pthread_rwlock_wrlock(&cache_locks[i]);
+            CacheNode* current = cache_table[i];
+            CacheNode* prev = NULL;
+            while(current != NULL) {
+                if(current->expires_at < time(NULL) && !current->is_downloading && current->ref_count == 0) {
+                    if(prev == NULL) {
+                        cache_table[i] = current->next;
+                    } else {
+                        prev->next = current->next;
+                    }
+                    
+                    if(current->memory_usage > 0) {
+                        atomic_fetch_sub(&total_cache_memory,current->memory_usage);
+                    }
+
+                    char cache_file[256];
+                    get_cache_filename(current->url,cache_file);
+                    unlink(cache_file);
+                    
+                    free(current->response);
+                    current->response = NULL;
+                    free(current);
+                    current = NULL;
+                    if(prev == NULL) {
+                        current = cache_table[i];
+                    } else {
+                        current = prev->next;
+                    }
+                } else {
+                    prev = current;
+                    current = current->next;
+                }
+            }
+        }
+    
+        compact_registry();
+    }
+}
 
 int parse_cache_policy(char* response_buffer) {
     int ttl = DEFAULT_TTL;// Default TTL
@@ -593,6 +706,7 @@ int check_cache_ram(ConnectionContext* ctx) {
                     ctx->send_mem_len = current->response_len;
                     ctx->send_mem_offset = current->response_len - current->body_size;
                     ctx->cached_at = current->cached_at;
+                    ctx->cache_ref = current;
                     atomic_store(&current->last_accessed,time(NULL));
                     atomic_fetch_add(&metric_cache_hits,1);
                     pthread_rwlock_unlock(&cache_locks[bucket]);
@@ -602,6 +716,7 @@ int check_cache_ram(ConnectionContext* ctx) {
                     ctx->upstream_header_len = current->upstream_header_len;
                     ctx->send_mem_buf = NULL;
                     ctx->cached_at = current->cached_at;
+                    ctx->cache_ref = current;
                     atomic_fetch_add(&metric_cache_hits,1);
                     pthread_rwlock_unlock(&cache_locks[bucket]);
                     return 1; // Cache Hit
@@ -625,6 +740,7 @@ int check_cache_ram(ConnectionContext* ctx) {
                         ctx->send_mem_len = current->response_len;
                         ctx->send_mem_offset = current->response_len - current->body_size;
                         ctx->cached_at = current->cached_at;
+                        ctx->cache_ref = current;
                         atomic_store(&current->last_accessed,time(NULL));
                         pthread_rwlock_unlock(&cache_locks[bucket]);
                         atomic_fetch_add(&metric_cache_hits,1);
@@ -633,6 +749,7 @@ int check_cache_ram(ConnectionContext* ctx) {
                     ctx->bytes_remaining = current->body_size;
                     ctx->upstream_header_len = current->upstream_header_len;
                     ctx->send_mem_buf = NULL;
+                    ctx->cache_ref = current;
                     pthread_rwlock_unlock(&cache_locks[bucket]);
                     atomic_fetch_add(&metric_cache_hits,1);
                     return 1; // Cache Hit
@@ -726,6 +843,8 @@ void handle_check_cache(ConnectionContext* ctx) {
     int cork = 1;
     setsockopt(ctx->client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
     //CACHE HIT
+    acquire_cache_ref(ctx->cache_ref);
+
     if(ctx->send_mem_buf != NULL) {
         ctx->write_len = 0;
         ctx->write_offset = 0;
@@ -835,7 +954,10 @@ void handle_send_cache(ConnectionContext *ctx) {
         int cork = 0;
         setsockopt(ctx->client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
     }
-
+    
+    release_cache_ref(ctx->cache_ref);
+    ctx->cache_ref = NULL;
+    
     if(ctx->keep_alive) {
         ctx->bytes_read = 0;
 
@@ -1122,7 +1244,7 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
     }
     
     epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->upstream_fd,NULL);
-    context_table[ctx->upstream_fd] = NULL;
+    atomic_store(&context_table[ctx->upstream_fd],NULL);
     
     if(upstream_dropped) {
         atomic_fetch_sub(&active_upstream_connections,1);
@@ -1275,10 +1397,9 @@ void rehydrate_cache() {
         if(file_size > 0) {
             RegistryRecord rec;
             while(fread(&rec,sizeof(RegistryRecord),1,reg) == 1) {
+                char cache_file[256];
+                get_cache_filename(rec.url,cache_file);
                 if(rec.expires_at > time(NULL) && rec.action == 'A') {
-                    char cache_file[256];
-                    get_cache_filename(rec.url,cache_file);
-
                     int read_fd = open(cache_file,O_RDONLY);
                     if(read_fd < 0) continue;
                     
@@ -1286,6 +1407,7 @@ void rehydrate_cache() {
                     char hdr_buf[BUFFER];
                     int hdr_len = read(read_fd,hdr_buf,rec.upstream_header_len);
                     if(hdr_len > 0 && hdr_len < rec.upstream_header_len) {
+                        close(read_fd);
                         continue;
                     }
 
@@ -1345,6 +1467,8 @@ void rehydrate_cache() {
                         add_to_cache_ram(NULL,rec.url, rec.expires_at,rec.cached_at,hdr_buf, hdr_len, NULL, body_size);
                     }
                     close(read_fd);
+                } else {
+                    unlink(cache_file);
                 }
             }
             fclose(reg);
@@ -1377,6 +1501,7 @@ void rehydrate_cache() {
                 char hdr_buf[BUFFER];
                 int hdr_len = read(read_fd,hdr_buf,header.upstream_header_len);
                 if(hdr_len > 0 && hdr_len < header.upstream_header_len) {
+                    close(read_fd);
                     continue;
                 }
 
