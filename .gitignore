@@ -63,6 +63,7 @@ proxy.log
 
 new/
 benchmark/
+custom_proxy_cache
 test.c
 cache_registry.bin
 proxy_env
