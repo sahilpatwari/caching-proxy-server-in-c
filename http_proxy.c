@@ -23,25 +23,17 @@
 #include"rate_limiter.h"
 #include"thread_pool.h"
 
-#define PORT "3490"
 #define BACKLOG SOMAXCONN
 #define BUFFER 8192
 #define MAX_FDS 65536
 #define EPOLL_BATCH_SIZE 512
 #define POOL_BUCKETS 1024
-#define POOL_MAX_CONNECTIONS 12000
-#define MAX_UPSTREAM_CONNS 2000
-#define IDLE_TIMEOUT_SEC 30
 _Atomic int active_upstream_connections = 0;
 
 _Atomic uint64_t global_upstream_latency_us = 50000;
-#define LATENCY_UPSTREAM_THRESHOLD 1500000
-
 _Atomic time_t circuit_cooldown_until = 0;
-#define COOLDOWN_SEC 5
-
 _Atomic int consecutive_upstream_errors = 0;
-#define MAX_CONSECUTIVE_ERRORS 20
+
 
 extern void abort_cache_download(char* url);
 extern int purge_cache_entry(char* url);
@@ -259,18 +251,18 @@ int free_context_stack_top = -1;
 static pthread_mutex_t context_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void init_context_pool() {
-    context_pool_memory = calloc(POOL_MAX_CONNECTIONS,sizeof(ConnectionContext));
-    free_context_stack = malloc(POOL_MAX_CONNECTIONS * sizeof(ConnectionContext*));
+    context_pool_memory = calloc(global_config.pool_max_connections,sizeof(ConnectionContext));
+    free_context_stack = malloc(global_config.pool_max_connections * sizeof(ConnectionContext*));
 
     if(!context_pool_memory || !free_context_stack) {
         printf("Failed to pre-allocate RAM");
         exit(EXIT_FAILURE);
     }
 
-    for(int i = 0; i < POOL_MAX_CONNECTIONS; i++) {
+    for(int i = 0; i < global_config.pool_max_connections; i++) {
         free_context_stack[i] = &context_pool_memory[i];
     }
-    free_context_stack_top = POOL_MAX_CONNECTIONS - 1;
+    free_context_stack_top = global_config.pool_max_connections - 1;
 }
 
 void destroy_context_pool() {
@@ -391,7 +383,7 @@ void free_context(ConnectionContext* ctx) {
     }
     
     pthread_mutex_lock(&context_pool_lock);
-    if(free_context_stack_top < POOL_MAX_CONNECTIONS - 1) {
+    if(free_context_stack_top < global_config.pool_max_connections - 1) {
         free_context_stack[++free_context_stack_top] = ctx;
         pthread_mutex_unlock(&context_pool_lock);
         return;
@@ -409,13 +401,13 @@ void* connection_reaper_worker(void* arg) {
             ConnectionContext* ctx = atomic_load(&context_table[i]);
             if(ctx != NULL) {
                 time_t last_act = atomic_load(&ctx->last_active);
-                if(last_act > 0 && (now - last_act) > IDLE_TIMEOUT_SEC) {
+                if(last_act > 0 && (now - last_act) > global_config.idle_timeout_sec) {
                     pthread_mutex_lock(&ctx->state_lock);
                     if(ctx->state != STATE_CLOSE) {
                         if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM || ctx->state == STATE_FETCH_UPSTREAM) {
                             int current_errors = atomic_fetch_add(&consecutive_upstream_errors,1) + 1;
                             char log_buf[128];
-                            snprintf(log_buf,sizeof(log_buf),"Reaper. Origin Timed Out. Strike: %d/%d",current_errors,MAX_CONSECUTIVE_ERRORS);
+                            snprintf(log_buf,sizeof(log_buf),"Reaper. Origin Timed Out. Strike: %d/%d",current_errors,global_config.max_consecutive_errors);
                             log_event(LEVEL_WARN,ctx->req_id,ctx->client_ip,log_buf);
                         } else {
                             char log_buf[128];
@@ -520,7 +512,7 @@ void handle_send_upstream(ConnectionContext* ctx) {
 
                 int current_errors = atomic_fetch_add(&consecutive_upstream_errors, 1) + 1;
                 char log_buf[128];
-                snprintf(log_buf, sizeof(log_buf), "Origin dropped connection during send(). Strike: %d/%d", current_errors, MAX_CONSECUTIVE_ERRORS);
+                snprintf(log_buf, sizeof(log_buf), "Origin dropped connection during send(). Strike: %d/%d", current_errors, global_config.max_consecutive_errors);
                 log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, log_buf);
 
                 epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->upstream_fd,NULL);
@@ -572,8 +564,8 @@ void handle_connect_upstream(ConnectionContext* ctx) {
         return;
     }
     
-    if(current_latency_us > LATENCY_UPSTREAM_THRESHOLD || current_errors > MAX_CONSECUTIVE_ERRORS) {
-        atomic_store(&circuit_cooldown_until,now + COOLDOWN_SEC);
+    if(current_latency_us > global_config.latency_upstream_threshold || current_errors > global_config.max_consecutive_errors) {
+        atomic_store(&circuit_cooldown_until,now + global_config.cooldown_sec);
 
         char log_buf[256];
         snprintf(log_buf, sizeof(log_buf), "Circuit Breaker: HALF-OPEN Probe. (EMA: %.2f ms | Errors: %d)", current_latency_us / 1000.0, current_errors);
@@ -670,7 +662,7 @@ void handle_wait_connect(ConnectionContext *ctx) {
     if (error != 0) {
         int current_errors = atomic_fetch_add(&consecutive_upstream_errors,1) + 1;
         char log_buf[128];
-        snprintf(log_buf,sizeof(log_buf),"Upstream Connection Failed (%s). Strike: %d / %d",strerror(error),current_errors,MAX_CONSECUTIVE_ERRORS);
+        snprintf(log_buf,sizeof(log_buf),"Upstream Connection Failed (%s). Strike: %d / %d",strerror(error),current_errors,global_config.max_consecutive_errors);
         log_event(LEVEL_WARN,ctx->req_id,ctx->client_ip,log_buf);
         send_error_response(ctx->client_fd, 502, "Bad Gateway", NULL);
         ctx->state = STATE_CLOSE;
@@ -1154,7 +1146,10 @@ void* worker_reactor_loop(void* args) {
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
-    if((status = getaddrinfo(NULL,PORT,&hints,&res)) == -1) {
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", global_config.port);
+
+    if((status = getaddrinfo(NULL,port_str,&hints,&res)) == -1) {
         fprintf(stderr,"worker: getaddrinfo: %s\n",gai_strerror(status));
         return NULL;
     }
@@ -1330,7 +1325,11 @@ int main(int argc,char* argv[]) {
     sigaction(SIGTERM, &sa, NULL); // Catch kill commands
 
     mkdir("cache", 0777);
-    init_log(LEVEL_ERROR);
+    
+    // Load config before initializing systems
+    load_config("proxy.conf");
+    
+    init_log(global_config.log_level);
     init_rate_limiter();
     init_connection_pool();
     init_cache();
@@ -1371,6 +1370,7 @@ int main(int argc,char* argv[]) {
     if(pthread_create(&dns_thread,NULL,dns_refresh_worker,NULL) != 0) {
         perror("Failed to start the dns thread");
     }
+    pthread_detach(dns_thread);
     printf("[System] DNS Thread started.\n");
     for(int i = 0; i < NUM_REACTORS; i++) {
         pthread_join(reactors[i],NULL);

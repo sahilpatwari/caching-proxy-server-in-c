@@ -5,12 +5,9 @@
 #include<pthread.h>
 #include<unistd.h>
 #include<netinet/in.h>
-#include"rate_limiter.h"
+#include "proxy.h"
+#include "rate_limiter.h"
 
-#define RATE_LIMITER_CAPACITY 10
-#define REFILL_RATE 1
-#define CLIENT_TIMEOUT 300      // Remove client if inactive for 300s
-#define CLEANUP_INTERVAL 120    // Run cleanup every 120s
 #define HASH_TABLE_SIZE 4096
 
 typedef struct ClientNode{
@@ -37,7 +34,7 @@ static unsigned long hash_ip(const char* str) {
 
 void* prune_stale_clients(void* args) {
     while(running) {
-       sleep(CLEANUP_INTERVAL);
+       sleep(global_config.cleanup_interval);
 
         time_t now = time(NULL);
         int pruned_count = 0;
@@ -48,7 +45,7 @@ void* prune_stale_clients(void* args) {
             ClientNode* prev = NULL;
 
             while(current != NULL) {
-                if(difftime(now,current->last_refill) > CLIENT_TIMEOUT) {
+                if(difftime(now,current->last_refill) > global_config.client_timeout) {
                     ClientNode* to_free = current;
 
                     if(prev == NULL) {
@@ -102,7 +99,7 @@ int check_rate_limit(char* client_ip) {
         } else {
             strncpy(target->ip,client_ip,INET6_ADDRSTRLEN - 1);
             target->ip[INET6_ADDRSTRLEN - 1] = '\0';
-            target->tokens = RATE_LIMITER_CAPACITY;
+            target->tokens = global_config.rate_limiter_capacity;
             target->last_refill = time(NULL);
             target->next = hash_table[bucket];
             hash_table[bucket] = target;
@@ -113,9 +110,9 @@ int check_rate_limit(char* client_ip) {
     time_t now = time(NULL);
     int seconds_passed = difftime(now,target->last_refill);
     if(seconds_passed > 0) {
-        target->tokens += seconds_passed * REFILL_RATE;
-        if(target->tokens > RATE_LIMITER_CAPACITY) {
-            target->tokens = RATE_LIMITER_CAPACITY;
+        target->tokens += seconds_passed * global_config.refill_rate;
+        if(target->tokens > global_config.rate_limiter_capacity) {
+            target->tokens = global_config.rate_limiter_capacity;
         }
         target->last_refill = now;
     }
