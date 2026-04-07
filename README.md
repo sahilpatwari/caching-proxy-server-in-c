@@ -12,32 +12,25 @@ Unlike traditional CDNs focusing on static files (like images or CSS), this prox
 
 ## 🏗 Architecture Diagram
 
-```mermaid
-flowchart TD
-    C1[Client 1] -->|GET /api/v1/data| P[Epoll Event Loop]
-    C2[Client 2] -->|GET /api/v1/data| P
-
-    subgraph Caching Proxy
-        P -->|Check lookup map| L{Is Cached?}
-        
-        L -- Yes --> S{Size < 1MB?}
-        S -- Yes --> Mem[(RAM Buffer)]
-        S -- No --> Disk[(Disk Spool)]
-        
-        Mem -.->|send syscall| C1
-        Disk -.->|sendfile syscall| C1
-        
-        L -- No --> DD{Designated Downloader?}
-        DD -- No --> W[Queue Waiter]
-        DD -- Yes --> U[Upstream Thread]
-        
-        U -->|Wake Up Waiters| W
-    end
-
-    U -->|1. Fetch| B[Backend API]
-    B -->|2. HTTP 200| U
-    U -->|3. Save| Mem
-    U -->|4. Persist| Disk
+```text
+  [ Client ]
+      │
+      ▼ (HTTP GET Request)
+┌─────────────────────────────────────────────────────────┐
+│                 Caching Proxy Server                    │
+│                                                         │
+│  Is the data in Cache?                                  │
+│  ├── YES ──▶ Size < 1MB?                                │
+│  │           ├── YES: Serve directly from RAM Buffer    │
+│  │           └── NO:  Serve from Disk via sendfile()    │
+│  │                                                      │
+│  └── NO ───▶ Is another client already downloading it?  │
+│              ├── YES: Queue Client safely as a Waiter   │
+│              └── NO:  Designated thread fetches backend │
+└─────────────────────────────────────────────────────────┘
+      │                                       ▲
+      ▼ (Forward Request)                     │ (Save Cache & Release Waiters)
+  [ Backend API ] ────────────────────────────┘
 ```
 
 ---
