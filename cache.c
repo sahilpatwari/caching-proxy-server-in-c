@@ -701,7 +701,7 @@ int add_to_cache_ram(ConnectionContext* ctx, char* url, time_t expires_at, time_
                 current->is_large = 0;
                 current->memory_usage = resp_len;
                 current->sync_to_disk = 0;
-                
+
                 if(ctx != NULL) {
                     ctx->send_mem_buf = current->response;
                     ctx->send_mem_len = resp_len;
@@ -1470,8 +1470,17 @@ void rehydrate_cache() {
                     int read_fd = open(cache_file,O_RDONLY);
                     if(read_fd < 0) continue;
                     
-                    lseek(read_fd,sizeof(CacheHeader),SEEK_SET);
                     char hdr_buf[BUFFER];
+                    
+                    // SECURITY GUARD against FORTIFY_SOURCE stack buffer overflow
+                    if(rec.upstream_header_len > BUFFER || rec.upstream_header_len < 0) {
+                        fprintf(stderr, "[rehydrate] Fatal: registry header length %d exceeds BUFFER %d! Skipping node.\n", 
+                                rec.upstream_header_len, BUFFER);
+                        close(read_fd);
+                        continue;
+                    }
+                    
+                    lseek(read_fd,sizeof(CacheHeader),SEEK_SET);
                     int hdr_len = read(read_fd,hdr_buf,rec.upstream_header_len);
                     if(hdr_len > 0 && hdr_len < rec.upstream_header_len) {
                         close(read_fd);
