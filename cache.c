@@ -71,6 +71,7 @@ void init_registry() {
 }
 
 void append_to_registry(char action,char* url,time_t expires_at,time_t cached_at,unsigned content_length,int upstream_header_len) {
+    return; // PERFORMANCE BYPASS: Disable blocking fflush() in reactor path
     if(!registry_file) return;
 
     RegistryRecord rec;
