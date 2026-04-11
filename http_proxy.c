@@ -35,7 +35,7 @@ _Atomic time_t circuit_cooldown_until = 0;
 _Atomic int consecutive_upstream_errors = 0;
 
 
-extern void abort_cache_download(char* url);
+extern void abort_cache_download(char* url,void* node_ref);
 extern int purge_cache_entry(char* url);
 extern void release_cache_ref(void* ref);
 // ATOMIC REQUEST ID COUNTER
@@ -354,7 +354,7 @@ void free_context(ConnectionContext* ctx) {
     if (ctx == NULL) return;
      
     if(ctx->is_designated_downloader) {
-        abort_cache_download(ctx->url);
+        abort_cache_download(ctx->url,ctx->cache_ref);
         ctx->is_designated_downloader = 0;
     }
     
