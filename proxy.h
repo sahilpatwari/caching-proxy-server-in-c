@@ -126,7 +126,8 @@ typedef struct ConnectionContext {
     void* cache_ref;
     int reactor_id;        // The ID of the owner reactor (0, 1, etc.)
     struct ConnectionContext* next_task; // For the Reactor's linked-list work queue
-    uint32_t epoll_interests; // Track currently registered epoll events
+    uint32_t client_interests;   // Track currently registered client events
+    uint32_t upstream_interests; // Track currently registered upstream events
 } ConnectionContext;
 
 typedef struct ConnectionNode {

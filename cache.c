@@ -1282,6 +1282,7 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
         }
     }
     
+    epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->upstream_fd,NULL);
     atomic_store(&context_table[ctx->upstream_fd],NULL);
     
     if(upstream_dropped) {

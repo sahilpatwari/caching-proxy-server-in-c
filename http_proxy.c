@@ -369,7 +369,8 @@ ConnectionContext* create_context(int fd) {
     ctx->req.hostname[0] = '\0';
     ctx->req.port = 0;
     ctx->req.path[0] = '\0';
-    ctx->epoll_interests = 0; // Fresh context has no interests
+    ctx->client_interests = 0;
+    ctx->upstream_interests = 0;
     atomic_store(&context_table[fd],ctx);
     return ctx; 
 }
@@ -594,6 +595,26 @@ void handle_connect_upstream(ConnectionContext* ctx) {
     if(warmfd != -1) {
         ctx->upstream_fd = warmfd;
         atomic_store(&context_table[warmfd],ctx);
+
+        struct epoll_event event;
+        event.data.fd = warmfd;
+        ctx->upstream_interests = EPOLLOUT | EPOLLET;
+        event.events = ctx->upstream_interests;
+
+        if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,warmfd,&event) == -1) {
+             // If ADD fails because it was already there (Ghost registration), MOD it
+             if(errno == EEXIST) {
+                 if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, warmfd, &event) == -1) {
+                     perror("epoll_ctl mod upstream (warm pool)");
+                     ctx->state = STATE_CLOSE;
+                     return;
+                 }
+             } else {
+                 perror("epoll_ctl add upstream (warm pool)");
+                 ctx->state = STATE_CLOSE;
+                 return;
+             }
+        }
 
         ctx->state = STATE_SEND_UPSTREAM;
         return;
@@ -853,9 +874,11 @@ void* handle_state_machine(void* args) {
     if(ctx->state != STATE_CLOSE && ctx->state != STATE_WAIT_CACHE) {
         uint32_t desired_events = 0;
         int target_fd = -1;
+        uint32_t* current_interests_ptr = NULL;
 
         if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM || ctx->state == STATE_FETCH_UPSTREAM) {
             target_fd = ctx->upstream_fd;
+            current_interests_ptr = &ctx->upstream_interests;
             if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM) {
                 desired_events = EPOLLOUT | EPOLLET;
             } else {
@@ -863,6 +886,7 @@ void* handle_state_machine(void* args) {
             }
         } else if(ctx->state == STATE_READ_REQUEST || ctx->state == STATE_SEND_RESPONSE_HEADERS || ctx->state == STATE_SEND_CACHE) {
             target_fd = ctx->client_fd;
+            current_interests_ptr = &ctx->client_interests;
             if(ctx->state == STATE_SEND_CACHE || ctx->state == STATE_SEND_RESPONSE_HEADERS) {
                 desired_events = EPOLLOUT | EPOLLET;
             } else {
@@ -870,14 +894,13 @@ void* handle_state_machine(void* args) {
             }
         }
 
-        if(target_fd != -1 && desired_events != ctx->epoll_interests) {
+        if(target_fd != -1 && current_interests_ptr != NULL && desired_events != *current_interests_ptr) {
             struct epoll_event event;
             memset(&event,0,sizeof(event));
             event.data.fd = target_fd;
             event.events = desired_events;
             
             if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, target_fd, &event) == -1) {
-                // If MOD fails because FD not in epoll (can happen during migration), try ADD
                 if (errno == ENOENT) {
                     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, target_fd, &event) == -1) {
                          perror("epoll_ctl add failed during ET switch");
@@ -889,7 +912,7 @@ void* handle_state_machine(void* args) {
                 }
             }
             if (ctx->state != STATE_CLOSE) {
-                ctx->epoll_interests = desired_events;
+                *current_interests_ptr = desired_events;
             }
         }
     }
@@ -1277,10 +1300,11 @@ void* worker_reactor_loop(void* args) {
 
                     ctx->thread_epoll_fd = epoll_fd;
                     ctx->reactor_id = r_id; 
-                    ctx->epoll_interests = EPOLLIN | EPOLLET; // Start with Read interest in ET mode
+                    ctx->client_interests = EPOLLIN | EPOLLET; 
+                    ctx->upstream_interests = 0;
 
                     event.data.fd = newfd;
-                    event.events = ctx->epoll_interests;
+                    event.events = ctx->client_interests;
                     if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,newfd,&event) == -1) {
                         perror("worker: epoll ctl failed adding client descriptor");
                         ctx->state = STATE_CLOSE;
