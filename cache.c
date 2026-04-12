@@ -33,7 +33,7 @@ extern _Atomic(ConnectionContext*) context_table[];
 extern void handle_connect_upstream(ConnectionContext* ctx);
 extern void handle_send_response_headers(ConnectionContext* ctx);
 extern void stash_connection(int fd,char* hostname,int port);
-
+extern void signal_reactor_task(int target_reactor_id,ConnectionContext* ctx);
 extern _Atomic uint64_t metric_cache_hits;
 extern _Atomic uint64_t metric_cache_misses;
 
@@ -42,6 +42,7 @@ extern _Atomic int consecutive_upstream_errors;
 static FILE* registry_file = NULL;
 static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
+extern Reactor* global_reactors;
 void* expiry_worker(void*);
 void* persistence_worker(void*);
 
@@ -566,16 +567,9 @@ void bypass_cache_for_waiters(char* url,CacheNode* target) {
                 pthread_mutex_lock(&waiter->state_lock);
                 if(waiter->state != STATE_CLOSE) {
                     waiter->state = STATE_CONNECT_UPSTREAM;
-
-                    struct epoll_event event;
-                    memset(&event,0,sizeof(event));
-                    event.data.fd = waiter->client_fd;
-                    event.events = EPOLLOUT | EPOLLONESHOT;
-
-                    epoll_ctl(waiter->thread_epoll_fd,EPOLL_CTL_MOD,waiter->client_fd,&event);
+                    signal_reactor_task(waiter->reactor_id, waiter);
                 }
                 pthread_mutex_unlock(&waiter->state_lock);
-                atomic_fetch_sub(&waiter->active_threads,1);
             }
             return;
         }
@@ -633,16 +627,9 @@ void abort_cache_download(char* url,void* node_ref) {
                     waiter->keep_alive = 0;
 
                     waiter->state = STATE_SEND_RESPONSE_HEADERS;
-
-                    struct epoll_event event;
-                    memset(&event,0,sizeof(event));
-                    event.data.fd = waiter->client_fd;
-                    event.events = EPOLLOUT | EPOLLONESHOT;
-
-                    epoll_ctl(waiter->thread_epoll_fd,EPOLL_CTL_MOD,waiter->client_fd,&event);
+                    signal_reactor_task(waiter->reactor_id, waiter);
                 }
                 pthread_mutex_unlock(&waiter->state_lock);
-                atomic_fetch_sub(&waiter->active_threads,1);
             }
 
             char cache_file[256];
@@ -740,16 +727,9 @@ int add_to_cache_ram(ConnectionContext* ctx, char* url, time_t expires_at, time_
                 pthread_mutex_lock(&waiter->state_lock);
                 if(waiter->state != STATE_CLOSE) {
                     waiter->state = STATE_CHECK_CACHE;
-
-                    struct epoll_event event;
-                    memset(&event,0,sizeof(event));
-                    event.data.fd = waiter->client_fd;
-                    event.events = EPOLLOUT | EPOLLONESHOT;
-
-                    epoll_ctl(waiter->thread_epoll_fd,EPOLL_CTL_MOD,waiter->client_fd,&event);
+                    signal_reactor_task(waiter->reactor_id, waiter);
                 }
                 pthread_mutex_unlock(&waiter->state_lock);
-                atomic_fetch_sub(&waiter->active_threads,1);
             }
             return 1;
     }
@@ -910,7 +890,6 @@ void handle_check_cache(ConnectionContext* ctx) {
         if(isHit == 0) {
             //CACHE MISS
             ctx->state = STATE_CONNECT_UPSTREAM;
-            handle_connect_upstream(ctx);
             return;
         } else if(isHit == -1) {
             ctx->state = STATE_WAIT_CACHE;
@@ -939,7 +918,6 @@ void handle_check_cache(ConnectionContext* ctx) {
         }
 
         ctx->state = STATE_SEND_RESPONSE_HEADERS;
-        handle_send_response_headers(ctx);
         return;
     }
     
@@ -967,7 +945,6 @@ void handle_check_cache(ConnectionContext* ctx) {
     ctx->send_mem_buf = NULL;
     lseek(ctx->file_fd,body_offset,SEEK_SET);
     ctx->state = STATE_SEND_RESPONSE_HEADERS;
-    handle_send_response_headers(ctx);
     return;
 }
 
@@ -1305,7 +1282,6 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
         }
     }
     
-    epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->upstream_fd,NULL);
     atomic_store(&context_table[ctx->upstream_fd],NULL);
     
     if(upstream_dropped) {
@@ -1377,7 +1353,6 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
         ctx->send_mem_buf = NULL;
         ctx->checkCache = 0;
         ctx->state = STATE_CHECK_CACHE;
-        handle_check_cache(ctx);
         return;
     }
     
@@ -1433,7 +1408,6 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
 
         ctx->checkCache = 0;
         ctx->state = STATE_CHECK_CACHE;
-        handle_check_cache(ctx);
         return;
     } else {
         add_to_cache_ram(NULL,ctx->url, finalHeader.expires_at,finalHeader.cached_at,file_buf, ctx->upstream_header_len,NULL, body_size);
@@ -1447,7 +1421,6 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
         ctx->checkCache = 0;
         ctx->send_mem_buf = NULL;
         ctx->state = STATE_CHECK_CACHE;
-        handle_check_cache(ctx);
         return;
     }
 }

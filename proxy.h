@@ -1,4 +1,3 @@
-#line 1 "c:\\Users\\sahil\\Documents\\caching-proxy-server-in-c\\proxy.h"
 #ifndef PROXY_H
 #define PROXY_H
 
@@ -66,7 +65,7 @@ typedef enum {
 
 
 
-typedef struct {
+typedef struct ConnectionContext {
     int client_fd;         
     int upstream_fd;        
     uint64_t req_id;       
@@ -125,6 +124,9 @@ typedef struct {
     struct timeval upstream_send_time;
 
     void* cache_ref;
+    int reactor_id;        // The ID of the owner reactor (0, 1, etc.)
+    struct ConnectionContext* next_task; // For the Reactor's linked-list work queue
+    uint32_t epoll_interests; // Track currently registered epoll events
 } ConnectionContext;
 
 typedef struct ConnectionNode {
@@ -143,6 +145,16 @@ typedef struct HostBucket{
     HostEntry* head;
     pthread_mutex_t bucket_lock;
 }HostBucket;
+
+
+typedef struct {
+    int reactor_id;
+    int epoll_fd;
+    int wakeup_fd;         // eventfd used for signalling
+    ConnectionContext* task_head;
+    ConnectionContext* task_tail;
+    pthread_mutex_t task_lock;
+} Reactor;
 
 
 void* handle_state_machine(void* args);

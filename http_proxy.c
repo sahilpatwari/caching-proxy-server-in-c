@@ -18,6 +18,7 @@
 #include<fcntl.h>
 #include<sys/epoll.h>
 #include <sys/resource.h> 
+#include<sys/eventfd.h>
 
 #include"cache.h"
 #include"rate_limiter.h"
@@ -74,7 +75,28 @@ static struct upstream_config {
 //EPOLL INSTANCE
 __thread int epoll_fd;
 HostBucket connection_map[POOL_BUCKETS];
+Reactor* global_reactors;
 void handle_connect_upstream(ConnectionContext* ctx);
+
+void signal_reactor_task(int target_reactor_id, ConnectionContext* ctx) {
+    Reactor* r = &global_reactors[target_reactor_id];
+
+    pthread_mutex_lock(&r->task_lock);
+    ctx->next_task = NULL;
+    if (r->task_tail == NULL) {
+        r->task_head = r->task_tail = ctx;
+    } else {
+        r->task_tail->next_task = ctx;
+        r->task_tail = ctx;
+    }
+    pthread_mutex_unlock(&r->task_lock);
+
+    uint64_t u = 1;
+    if (write(r->wakeup_fd, &u, sizeof(uint64_t)) == -1) {
+        if (errno != EAGAIN) perror("signal_reactor_task: write failed");
+    }
+}
+
 static unsigned long hash_host(const char* hostname,int port) {
     unsigned long hash = 5381;
     int c;
@@ -292,6 +314,7 @@ ConnectionContext* create_context(int fd) {
     ctx->send_mem_buf = NULL;
     ctx->send_mem_len = 0;
     ctx->send_mem_offset = 0;
+    ctx->next_task = NULL;
 
     struct sockaddr_storage addr;
     socklen_t addr_size = sizeof(addr);
@@ -346,6 +369,7 @@ ConnectionContext* create_context(int fd) {
     ctx->req.hostname[0] = '\0';
     ctx->req.port = 0;
     ctx->req.path[0] = '\0';
+    ctx->epoll_interests = 0; // Fresh context has no interests
     atomic_store(&context_table[fd],ctx);
     return ctx; 
 }
@@ -362,8 +386,6 @@ void free_context(ConnectionContext* ctx) {
     ctx->cache_ref = NULL;
 
     if (ctx->upstream_fd != -1) {
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->upstream_fd, NULL);
-        
         atomic_store(&context_table[ctx->upstream_fd],NULL); 
         atomic_fetch_sub(&active_upstream_connections,1);
         close(ctx->upstream_fd);
@@ -376,7 +398,6 @@ void free_context(ConnectionContext* ctx) {
     }
 
     if (ctx->client_fd != -1) {
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->client_fd, NULL);
         atomic_store(&context_table[ctx->client_fd],NULL);
         close(ctx->client_fd);
         ctx->client_fd = -1;
@@ -417,13 +438,9 @@ void* connection_reaper_worker(void* arg) {
 
                         
                         ctx->state = STATE_CLOSE;
-
-                        struct epoll_event event;
-                        memset(&event,0,sizeof(event));
-                        event.data.fd = ctx->client_fd;
-                        event.events = EPOLLOUT | EPOLLONESHOT;
                         if(ctx->client_fd != -1) {
-                            epoll_ctl(ctx->thread_epoll_fd,EPOLL_CTL_MOD,ctx->client_fd,&event);
+                            atomic_fetch_add(&ctx->active_threads, 1);
+                            signal_reactor_task(ctx->reactor_id, ctx);
                         }
                     }
                     pthread_mutex_unlock(&ctx->state_lock);
@@ -465,8 +482,6 @@ void handle_send_response_headers(ConnectionContext* ctx) {
         ctx->write_offset += bytes_sent;
     }
     ctx->state = STATE_SEND_CACHE;
-
-    handle_send_cache(ctx);
 }
 
 void handle_send_upstream(ConnectionContext* ctx) {
@@ -515,14 +530,12 @@ void handle_send_upstream(ConnectionContext* ctx) {
                 snprintf(log_buf, sizeof(log_buf), "Origin dropped connection during send(). Strike: %d/%d", current_errors, global_config.max_consecutive_errors);
                 log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, log_buf);
 
-                epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->upstream_fd,NULL);
                 atomic_store(&context_table[ctx->upstream_fd],NULL);
                 close(ctx->upstream_fd);
                 ctx->upstream_fd = -1;
                 atomic_fetch_sub(&active_upstream_connections, 1);
 
                 ctx->state = STATE_CONNECT_UPSTREAM;
-                handle_connect_upstream(ctx);
                 return;
             }
             perror("upstream send error");
@@ -582,18 +595,7 @@ void handle_connect_upstream(ConnectionContext* ctx) {
         ctx->upstream_fd = warmfd;
         atomic_store(&context_table[warmfd],ctx);
 
-        struct epoll_event event;
-        event.data.fd = warmfd;
-        event.events = EPOLLOUT | EPOLLONESHOT;
-
-        if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,warmfd,&event) == -1) {
-             perror("epoll_ctl add upstream");
-             ctx->state = STATE_CLOSE;
-             return;
-        }
-
         ctx->state = STATE_SEND_UPSTREAM;
-        handle_send_upstream(ctx);
         return;
     }
     
@@ -630,16 +632,6 @@ void handle_connect_upstream(ConnectionContext* ctx) {
     ctx->upstream_fd = sockfd;
     atomic_store(&context_table[sockfd],ctx);
     
-    struct epoll_event event;
-    memset(&event,0,sizeof(event));
-    event.data.fd = sockfd;
-    event.events = EPOLLOUT | EPOLLONESHOT;
-    if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sockfd, &event) == -1) {
-        perror("epoll_ctl add upstream");
-        ctx->state = STATE_CLOSE;
-        return;
-    }
-
     if(connect_res == 0) {
         ctx->state = STATE_SEND_UPSTREAM;
     } else {
@@ -670,7 +662,6 @@ void handle_wait_connect(ConnectionContext *ctx) {
     }
 
     ctx->state = STATE_SEND_UPSTREAM;
-    handle_send_upstream(ctx); 
 }
 
 void handle_parse_request(ConnectionContext* ctx) {
@@ -702,9 +693,11 @@ void handle_parse_request(ConnectionContext* ctx) {
     }
 
     //printf("[Proxy] Request: %s %s\n", method, url);
-    char log_buf[1536];
-    snprintf(log_buf, sizeof(log_buf), "Request: %s %s:%d", ctx->method, (ctx->req).hostname, (ctx->req).port);
-    log_event(LEVEL_INFO, ctx->req_id, ctx->client_ip, log_buf);
+    if (global_config.log_level == LEVEL_INFO) {
+        char log_buf[1536];
+        snprintf(log_buf, sizeof(log_buf), "Request: %s %s:%d", ctx->method, (ctx->req).hostname, (ctx->req).port);
+        log_event(LEVEL_INFO, ctx->req_id, ctx->client_ip, log_buf);
+    }
     
     atomic_fetch_add(&metric_total_requests,1);
     
@@ -776,7 +769,6 @@ void handle_parse_request(ConnectionContext* ctx) {
         } 
         ctx->state = STATE_CHECK_CACHE;
         ctx->checkCache = 1;
-        handle_check_cache(ctx);
     } else {
         send_error_response(ctx->client_fd,501,"Not Implemented",NULL);
         log_event(LEVEL_WARN, ctx->req_id, ctx->client_ip, "Unsupported Method");
@@ -807,83 +799,97 @@ void handle_read_request(ConnectionContext* ctx) {
 
         if(strstr(ctx->read_buf,"\r\n\r\n") != NULL) {
             ctx->state = STATE_PARSE_REQUEST;
-            handle_parse_request(ctx);
             return;
         }
     }
 }
 void* handle_state_machine(void* args) {
     ConnectionContext* ctx = (ConnectionContext*)args;
-
     if(ctx == NULL) return NULL;
 
-
+    int state_changed = 1;
     pthread_mutex_lock(&ctx->state_lock);
-    if(ctx->state != STATE_CLOSE) {
-        switch(ctx->state) {
-            case STATE_READ_REQUEST:
-                handle_read_request(ctx);
-                break;
-            case STATE_PARSE_REQUEST:
-                handle_parse_request(ctx);
-                break;
-            case STATE_CHECK_CACHE:
-                handle_check_cache(ctx);
-                break;
-            case STATE_SEND_CACHE:
-                handle_send_cache(ctx);
-                break;
-            case STATE_CONNECT_UPSTREAM:
-                handle_connect_upstream(ctx);
-                break;
-            case STATE_WAIT_CONNECT:
-                handle_wait_connect(ctx);
-                break;
-            case STATE_SEND_UPSTREAM:
-                handle_send_upstream(ctx);
-                break;
-            case STATE_FETCH_UPSTREAM:
-                handle_fetch_upstream(ctx);
-                break;
-            case STATE_SEND_RESPONSE_HEADERS:
-                handle_send_response_headers(ctx);
-                break;
-            /*case STATE_TUNNELING:
-                handle_tunnel_request(ctx);
-                break;*/ 
+
+    while(state_changed) {
+        ConnectionState initialState = ctx->state;
+        if(ctx->state != STATE_CLOSE) {
+            switch(ctx->state) {
+                case STATE_READ_REQUEST:
+                    handle_read_request(ctx);
+                    break;
+                case STATE_PARSE_REQUEST:
+                    handle_parse_request(ctx);
+                    break;
+                case STATE_CHECK_CACHE:
+                    handle_check_cache(ctx);
+                    break;
+                case STATE_SEND_CACHE:
+                    handle_send_cache(ctx);
+                    break;
+                case STATE_CONNECT_UPSTREAM:
+                    handle_connect_upstream(ctx);
+                    break;
+                case STATE_WAIT_CONNECT:
+                    handle_wait_connect(ctx);
+                    break;
+                case STATE_SEND_UPSTREAM:
+                    handle_send_upstream(ctx);
+                    break;
+                case STATE_FETCH_UPSTREAM:
+                    handle_fetch_upstream(ctx);
+                    break;
+                case STATE_SEND_RESPONSE_HEADERS:
+                    handle_send_response_headers(ctx);
+                    break;
+            }
+        }
+        
+        state_changed = 0;
+        if(ctx->state != initialState && ctx->state != STATE_CLOSE && ctx->state != STATE_WAIT_CACHE) {
+            state_changed = 1;
         }
     }
     
     if(ctx->state != STATE_CLOSE && ctx->state != STATE_WAIT_CACHE) {
-        struct epoll_event event;
-        memset(&event,0,sizeof(event));
-        if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM || ctx->state == STATE_FETCH_UPSTREAM) {
-            event.data.fd = ctx->upstream_fd;
-            if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM) {
-                event.events = EPOLLOUT | EPOLLONESHOT;
-            } else {
-                event.events = EPOLLIN | EPOLLONESHOT;
-            }
-            
-            if(ctx->upstream_fd != -1) {
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ctx->upstream_fd, &event) == -1) {
-                    perror("epoll_ctl mod upstream failed");
-                    ctx->state = STATE_CLOSE; 
-                }
-            }
-        } else if(ctx->state == STATE_READ_REQUEST ||  ctx->state == STATE_SEND_RESPONSE_HEADERS || ctx->state == STATE_SEND_CACHE) {
-            event.data.fd = ctx->client_fd;
-            if(ctx->state == STATE_SEND_CACHE || ctx->state == STATE_SEND_RESPONSE_HEADERS) {
-                event.events = EPOLLOUT | EPOLLONESHOT;
-            } else {
-                event.events = EPOLLIN | EPOLLONESHOT;
-            }
+        uint32_t desired_events = 0;
+        int target_fd = -1;
 
-            if(ctx->client_fd != -1) {
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ctx->client_fd, &event) == -1) {
-                    perror("epoll_ctl mod client failed");
+        if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM || ctx->state == STATE_FETCH_UPSTREAM) {
+            target_fd = ctx->upstream_fd;
+            if(ctx->state == STATE_WAIT_CONNECT || ctx->state == STATE_SEND_UPSTREAM) {
+                desired_events = EPOLLOUT | EPOLLET;
+            } else {
+                desired_events = EPOLLIN | EPOLLET;
+            }
+        } else if(ctx->state == STATE_READ_REQUEST || ctx->state == STATE_SEND_RESPONSE_HEADERS || ctx->state == STATE_SEND_CACHE) {
+            target_fd = ctx->client_fd;
+            if(ctx->state == STATE_SEND_CACHE || ctx->state == STATE_SEND_RESPONSE_HEADERS) {
+                desired_events = EPOLLOUT | EPOLLET;
+            } else {
+                desired_events = EPOLLIN | EPOLLET;
+            }
+        }
+
+        if(target_fd != -1 && desired_events != ctx->epoll_interests) {
+            struct epoll_event event;
+            memset(&event,0,sizeof(event));
+            event.data.fd = target_fd;
+            event.events = desired_events;
+            
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, target_fd, &event) == -1) {
+                // If MOD fails because FD not in epoll (can happen during migration), try ADD
+                if (errno == ENOENT) {
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, target_fd, &event) == -1) {
+                         perror("epoll_ctl add failed during ET switch");
+                         ctx->state = STATE_CLOSE;
+                    }
+                } else {
+                    perror("epoll_ctl mod failed in ET switch");
                     ctx->state = STATE_CLOSE; 
                 }
+            }
+            if (ctx->state != STATE_CLOSE) {
+                ctx->epoll_interests = desired_events;
             }
         }
     }
@@ -1139,6 +1145,8 @@ void* dns_refresh_worker(void* arg) {
 }
 
 void* worker_reactor_loop(void* args) {
+    int r_id = (int)(intptr_t)args;
+    Reactor* reactor = &global_reactors[r_id];
     int status, sockfd = -1,yes = 1;
     struct addrinfo hints,*res,*p;
     memset(&hints,0,sizeof(hints));
@@ -1193,6 +1201,7 @@ void* worker_reactor_loop(void* args) {
     make_socket_non_blocking(sockfd); //make the main listener non-blocking
 
     epoll_fd = epoll_create1(0);
+    reactor->epoll_fd = epoll_fd;
     if(epoll_fd == -1) {
         perror("worker: epoll instance creation failed");
         exit(1);
@@ -1203,9 +1212,24 @@ void* worker_reactor_loop(void* args) {
     struct epoll_event events[EPOLL_BATCH_SIZE];
 
     event.data.fd = sockfd;
-    event.events = EPOLLIN;
+    event.events = EPOLLIN | EPOLLET; // Listner must be Edge-Triggered
     if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,sockfd,&event) == -1) {
         perror("worker: epoll ctl: sockfd failed");
+        exit(1);
+    }
+    
+    reactor->wakeup_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if(reactor->wakeup_fd == -1) {
+        perror("eventfd creation failed");
+        exit(1);
+    }
+
+    struct epoll_event ev;
+    memset(&ev,0,sizeof(ev));
+    ev.data.fd = reactor->wakeup_fd;
+    ev.events = EPOLLIN;
+    if(epoll_ctl(reactor->epoll_fd,EPOLL_CTL_ADD,reactor->wakeup_fd,&ev) == -1) {
+        perror("wakeup fd: add failed");
         exit(1);
     }
     
@@ -1252,8 +1276,11 @@ void* worker_reactor_loop(void* args) {
                     }
 
                     ctx->thread_epoll_fd = epoll_fd;
+                    ctx->reactor_id = r_id; 
+                    ctx->epoll_interests = EPOLLIN | EPOLLET; // Start with Read interest in ET mode
+
                     event.data.fd = newfd;
-                    event.events = EPOLLIN | EPOLLONESHOT;
+                    event.events = ctx->epoll_interests;
                     if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,newfd,&event) == -1) {
                         perror("worker: epoll ctl failed adding client descriptor");
                         ctx->state = STATE_CLOSE;
@@ -1262,6 +1289,25 @@ void* worker_reactor_loop(void* args) {
                         continue;
                     }
                 }
+            } else if(currentfd == reactor->wakeup_fd) {
+                uint64_t u;
+                if (read(reactor->wakeup_fd, &u, sizeof(uint64_t)) == -1) {
+                    if (errno != EAGAIN) perror("read eventfd failed");
+                }
+                
+                // Atomically steal the entire task list
+                pthread_mutex_lock(&reactor->task_lock);
+                ConnectionContext* current = reactor->task_head;
+                reactor->task_head = reactor->task_tail = NULL;
+                pthread_mutex_unlock(&reactor->task_lock);
+
+                // Process the stolen list without holding the lock
+                while(current != NULL) {
+                    ConnectionContext* next = current->next_task;
+                    handle_state_machine(current);
+                    current = next;
+                }
+                continue;
             } else {
                 ConnectionContext* ctx = atomic_load(&context_table[currentfd]);
                 if(ctx != NULL) {
@@ -1343,10 +1389,19 @@ int main(int argc,char* argv[]) {
     
     server_start_time = time(NULL);
 
-    int NUM_REACTORS = 8;
+    int NUM_REACTORS = sysconf(_SC_NPROCESSORS_ONLN);
+    // Initialize Global Reactors
+    global_reactors = malloc(sizeof(Reactor) * NUM_REACTORS);
+    for (int i = 0; i < NUM_REACTORS; i++) {
+        global_reactors[i].reactor_id = i;
+        global_reactors[i].task_head = global_reactors[i].task_tail = NULL;
+        pthread_mutex_init(&global_reactors[i].task_lock, NULL);
+    }
+
     pthread_t reactors[NUM_REACTORS];
     for(int i = 0; i < NUM_REACTORS; i++) {
-        if(pthread_create(&reactors[i],NULL,worker_reactor_loop,NULL) != 0) {
+        // Pass the Reactor pointer directly to the thread
+        if(pthread_create(&reactors[i],NULL,worker_reactor_loop, (void*)(intptr_t)i) != 0) {
             perror("Failed to start worker reactor thread");
         }
     }
