@@ -113,8 +113,10 @@ void log_event(LogLevel level, uint64_t req_id, const char *client_ip,const char
         LogQueue[tail].msg[MAX_LOG_MSG - 1] = '\0';
         tail = (tail + 1) % LOG_QUEUE_SIZE;
         count++;
-
-        pthread_cond_broadcast(&log_notify);
+        
+        if(count >= 128) {
+            pthread_cond_broadcast(&log_notify);
+        }
     }
 
     pthread_mutex_unlock(&log_lock);

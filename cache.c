@@ -541,7 +541,7 @@ void bypass_cache_for_waiters(char* url,CacheNode* target) {
             int temp_num_waiters = current->num_waiters;
             ConnectionContext* wakeup_waiters[NUM_REACTORS][waiters_per_core];
             int waiter_count[MAX_REACTORS] = {0};
-            
+
             for(int i = 0; i < temp_num_waiters; i++) {
                 temp_waiters[i] = current->waiters[i];
             }
@@ -722,7 +722,9 @@ int add_to_cache_ram(ConnectionContext* ctx, char* url, time_t expires_at, time_
                     p_tail = (p_tail + 1) % PERSIST_QUEUE_SIZE;
                     p_count++;
                     atomic_fetch_add(&current->ref_count,1);
-                    pthread_cond_signal(&p_notify);
+                    if(p_count >= 128) {
+                        pthread_cond_signal(&p_notify);
+                    }
                 } else {
                     log_event(LEVEL_WARN, 0, "[system]", "Persistence queue filled to 8192! Dropping disk sync to prevent network IO crash.");
                 }
