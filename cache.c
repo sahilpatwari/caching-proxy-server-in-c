@@ -782,7 +782,6 @@ int check_cache_ram(ConnectionContext* ctx) {
     
     pthread_rwlock_rdlock(&cache_locks[bucket]);
     CacheNode* current = cache_table[bucket];
-    CacheNode* prev = NULL;
     while(current != NULL) {
         if(strcmp(ctx->url,current->url) == 0) {
             if(!current->is_downloading && current->expires_at > time(NULL) ) {
@@ -791,6 +790,7 @@ int check_cache_ram(ConnectionContext* ctx) {
                     ctx->send_mem_len = current->response_len;
                     ctx->send_mem_offset = current->response_len - current->body_size;
                     ctx->cached_at = current->cached_at;
+                    ctx->cache_ref = current;
                     atomic_store(&current->last_accessed,time(NULL));
                     atomic_fetch_add(&metric_cache_hits,1);
                     pthread_rwlock_unlock(&cache_locks[bucket]);
@@ -800,6 +800,7 @@ int check_cache_ram(ConnectionContext* ctx) {
                     ctx->upstream_header_len = current->upstream_header_len;
                     ctx->send_mem_buf = NULL;
                     ctx->cached_at = current->cached_at;
+                    ctx->cache_ref = current;
                     atomic_fetch_add(&metric_cache_hits,1);
                     pthread_rwlock_unlock(&cache_locks[bucket]);
                     return 1; // Cache Hit
@@ -807,12 +808,13 @@ int check_cache_ram(ConnectionContext* ctx) {
             }
             break;
         }
-        prev = current;
         current = current->next;
     }
     pthread_rwlock_unlock(&cache_locks[bucket]);
     
     pthread_rwlock_wrlock(&cache_locks[bucket]);
+    current = cache_table[bucket];
+    CacheNode* prev = NULL;
     while(current != NULL) {
        if(strcmp(ctx->url,current->url) == 0) {
             //Recheck in write lock

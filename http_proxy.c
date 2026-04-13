@@ -1273,7 +1273,7 @@ void* worker_reactor_loop(void* args) {
         exit(1);
     }
     
-    ConnectionContext* local_stolen_head = NULL;
+   ConnectionContext* local_stolen_head = NULL;
 
     while(server_running) {
         
@@ -1342,17 +1342,14 @@ void* worker_reactor_loop(void* args) {
                 atomic_store(&reactor->wakeup_pending, 0);
                 // Atomically steal the entire task list
                 pthread_mutex_lock(&reactor->task_lock);
-                ConnectionContext* new_tasks = reactor->task_head;
+                if(local_stolen_head == NULL) {
+                    local_stolen_head = reactor->task_head;
+                } else {
+                    reactor->task_tail->next_task = local_stolen_head;
+                    local_stolen_head = reactor->task_head;
+                }
                 reactor->task_head = reactor->task_tail = NULL;
                 pthread_mutex_unlock(&reactor->task_lock);
-
-                if(local_stolen_head == NULL) {
-                    local_stolen_head = new_tasks;
-                } else {
-                    ConnectionContext* temp = local_stolen_head;
-                    while(temp->next_task) temp = temp->next_task;
-                    temp->next_task = new_tasks;
-                }
 
             } else {
                 ConnectionContext* ctx = atomic_load(&context_table[currentfd]);
