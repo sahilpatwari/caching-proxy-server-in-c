@@ -155,6 +155,7 @@ typedef struct {
     ConnectionContext* task_head;
     ConnectionContext* task_tail;
     pthread_mutex_t task_lock;
+    _Atomic int wakeup_pending;
 } Reactor;
 
 

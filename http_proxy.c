@@ -27,8 +27,9 @@
 #define BACKLOG SOMAXCONN
 #define BUFFER 8192
 #define MAX_FDS 65536
-#define EPOLL_BATCH_SIZE 512
+#define EPOLL_BATCH_SIZE 128
 #define POOL_BUCKETS 1024
+#define NUM_REACTORS sysconf(_SC_NPROCESSORS_ONLN)
 _Atomic int active_upstream_connections = 0;
 
 _Atomic uint64_t global_upstream_latency_us = 50000;
@@ -78,22 +79,27 @@ HostBucket connection_map[POOL_BUCKETS];
 Reactor* global_reactors;
 void handle_connect_upstream(ConnectionContext* ctx);
 
-void signal_reactor_task(int target_reactor_id, ConnectionContext* ctx) {
+void signal_reactor_task_bulk(int target_reactor_id, ConnectionContext** waiters,int count) {
     Reactor* r = &global_reactors[target_reactor_id];
 
     pthread_mutex_lock(&r->task_lock);
-    ctx->next_task = NULL;
-    if (r->task_tail == NULL) {
-        r->task_head = r->task_tail = ctx;
-    } else {
-        r->task_tail->next_task = ctx;
-        r->task_tail = ctx;
+    for(int i = 0; i < count; i++) {
+        ConnectionContext* ctx = waiters[i];
+        ctx->next_task = NULL;
+        if (r->task_tail == NULL) {
+            r->task_head = r->task_tail = ctx;
+        } else {
+            r->task_tail->next_task = ctx;
+            r->task_tail = ctx;
+        }
     }
     pthread_mutex_unlock(&r->task_lock);
 
     uint64_t u = 1;
-    if (write(r->wakeup_fd, &u, sizeof(uint64_t)) == -1) {
-        if (errno != EAGAIN) perror("signal_reactor_task: write failed");
+    if(atomic_exchange(&r->wakeup_pending,1) == 0) {
+        if (write(r->wakeup_fd, &u, sizeof(uint64_t)) == -1) {
+            if (errno != EAGAIN) perror("signal_reactor_task: write failed");
+        }
     }
 }
 
@@ -1256,8 +1262,11 @@ void* worker_reactor_loop(void* args) {
         exit(1);
     }
     
-    while(server_running) {
+    ConnectionContext* local_stolen_head = NULL;
 
+    while(server_running) {
+        
+        int timeout = (local_stolen_head == NULL) ? 1000 : 0;
         int n_ready = epoll_wait(epoll_fd,events,EPOLL_BATCH_SIZE,1000);
         if(n_ready == -1) {
             if(errno == EINTR) {
@@ -1319,19 +1328,21 @@ void* worker_reactor_loop(void* args) {
                     if (errno != EAGAIN) perror("read eventfd failed");
                 }
                 
+                atomic_store(&reactor->wakeup_pending, 0);
                 // Atomically steal the entire task list
                 pthread_mutex_lock(&reactor->task_lock);
-                ConnectionContext* current = reactor->task_head;
+                ConnectionContext* new_tasks = reactor->task_head;
                 reactor->task_head = reactor->task_tail = NULL;
                 pthread_mutex_unlock(&reactor->task_lock);
 
-                // Process the stolen list without holding the lock
-                while(current != NULL) {
-                    ConnectionContext* next = current->next_task;
-                    handle_state_machine(current);
-                    current = next;
+                if(local_stolen_head == NULL) {
+                    local_stolen_head = new_tasks;
+                } else {
+                    ConnectionContext* temp = local_stolen_head;
+                    while(temp->next_task) temp = temp->next_task;
+                    temp->next_task = new_tasks;
                 }
-                continue;
+
             } else {
                 ConnectionContext* ctx = atomic_load(&context_table[currentfd]);
                 if(ctx != NULL) {
@@ -1342,6 +1353,13 @@ void* worker_reactor_loop(void* args) {
                     fprintf(stderr,"Ghost file descriptor event triggered on fd %d\n",currentfd);
                 }
             }
+        }
+
+        int quota = 1024;
+        while(local_stolen_head != NULL && quota-- > 0) {
+            ConnectionContext* current = local_stolen_head;
+            handle_state_machine(current);
+            local_stolen_head = current->next_task;
         }
     }
     close(epoll_fd);
@@ -1400,7 +1418,7 @@ int main(int argc,char* argv[]) {
     load_config("proxy.conf");
     
     init_log(global_config.log_level);
-    init_rate_limiter();
+    //init_rate_limiter();
     init_connection_pool();
     init_cache();
     init_context_pool();
@@ -1413,7 +1431,6 @@ int main(int argc,char* argv[]) {
     
     server_start_time = time(NULL);
 
-    int NUM_REACTORS = sysconf(_SC_NPROCESSORS_ONLN);
     // Initialize Global Reactors
     global_reactors = malloc(sizeof(Reactor) * NUM_REACTORS);
     for (int i = 0; i < NUM_REACTORS; i++) {

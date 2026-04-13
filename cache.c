@@ -36,6 +36,7 @@ extern void stash_connection(int fd,char* hostname,int port);
 extern void signal_reactor_task(int target_reactor_id,ConnectionContext* ctx);
 extern _Atomic uint64_t metric_cache_hits;
 extern _Atomic uint64_t metric_cache_misses;
+extern int NUM_REACTORS
 
 extern _Atomic uint64_t global_upstream_latency_us;
 extern _Atomic int consecutive_upstream_errors;
@@ -538,6 +539,8 @@ void bypass_cache_for_waiters(char* url,CacheNode* target) {
 
             ConnectionContext* temp_waiters[MAX_WAITERS];
             int temp_num_waiters = current->num_waiters;
+            ConnectionContext* wakeup_waiters[NUM_REACTORS][waiters_per_core];
+            int waiter_count[MAX_REACTORS] = {0};
             
             for(int i = 0; i < temp_num_waiters; i++) {
                 temp_waiters[i] = current->waiters[i];
@@ -567,10 +570,18 @@ void bypass_cache_for_waiters(char* url,CacheNode* target) {
                 pthread_mutex_lock(&waiter->state_lock);
                 if(waiter->state != STATE_CLOSE) {
                     waiter->state = STATE_CONNECT_UPSTREAM;
-                    signal_reactor_task(waiter->reactor_id, waiter);
+                    int r_id = waiter->reactor_id;
+                    wakeup_waiters[r_id][waiter_count[r_id]++] = waiter;
                 }
                 pthread_mutex_unlock(&waiter->state_lock);
             }
+
+            for(int i = 0; i < NUM_REACTORS; i++) {
+                if(waiter_count[i] > 0) {
+                    signal_reactor_task_bulk(i,wakeup_waiters[i],waiter_count[i]);
+                }
+            }
+
             return;
         }
         prev = current;
@@ -591,6 +602,9 @@ void abort_cache_download(char* url,void* node_ref) {
         if(current == target) {
             ConnectionContext* temp_waiters[MAX_WAITERS];
             int temp_num_waiters = 0;
+            int waiters_per_core = MAX_WAITERS / NUM_REACTORS;
+            ConnectionContext* wakeup_waiters[NUM_REACTORS][waiters_per_core];
+            int waiter_count[MAX_REACTORS] = {0};
 
             if(current->is_downloading) {
                 temp_num_waiters = current->num_waiters;
@@ -627,9 +641,16 @@ void abort_cache_download(char* url,void* node_ref) {
                     waiter->keep_alive = 0;
 
                     waiter->state = STATE_SEND_RESPONSE_HEADERS;
-                    signal_reactor_task(waiter->reactor_id, waiter);
+                    int r_id = waiter->reactor_id;
+                    wakeup_waiters[r_id][waiter_count[r_id]++] = waiter;
                 }
                 pthread_mutex_unlock(&waiter->state_lock);
+            }
+            
+            for(int i = 0; i < NUM_REACTORS; i++) {
+                if(waiter_count[i] > 0) {
+                    signal_reactor_task_bulk(i,wakeup_waiters[i],waiter_count[i]);
+                }
             }
 
             char cache_file[256];
@@ -714,6 +735,9 @@ int add_to_cache_ram(ConnectionContext* ctx, char* url, time_t expires_at, time_
             }
 
             ConnectionContext* temp_waiters[MAX_WAITERS];
+            int waiters_per_core = MAX_WAITERS / NUM_REACTORS;
+            ConnectionContext* wakeup_waiters[NUM_REACTORS][waiters_per_core];
+            int waiter_count[MAX_REACTORS] = {0};
             int temp_num_waiters = current->num_waiters;
             for(int i = 0; i < temp_num_waiters; i++) {
                 temp_waiters[i] = current->waiters[i];
@@ -727,9 +751,16 @@ int add_to_cache_ram(ConnectionContext* ctx, char* url, time_t expires_at, time_
                 pthread_mutex_lock(&waiter->state_lock);
                 if(waiter->state != STATE_CLOSE) {
                     waiter->state = STATE_CHECK_CACHE;
-                    signal_reactor_task(waiter->reactor_id, waiter);
+                    int r_id = waiter->reactor_id;
+                    wakeup_waiters[r_id][waiter_count[r_id]++] = waiter;
                 }
                 pthread_mutex_unlock(&waiter->state_lock);
+            }
+            
+            for(int i = 0; i < NUM_REACTORS; i++) {
+                if(waiter_count[i] > 0) {
+                    signal_reactor_task_bulk(i,wakeup_waiters[i],waiter_count[i]);
+                }
             }
             return 1;
     }
