@@ -29,7 +29,7 @@
 #define MAX_FDS 65536
 #define EPOLL_BATCH_SIZE 128
 #define POOL_BUCKETS 1024
-#define NUM_REACTORS sysconf(_SC_NPROCESSORS_ONLN)
+
 _Atomic int active_upstream_connections = 0;
 
 _Atomic uint64_t global_upstream_latency_us = 50000;
@@ -425,6 +425,10 @@ void* connection_reaper_worker(void* arg) {
     while(server_running) {
         sleep(5);
         time_t now = time(NULL);
+        int reaped_per_core = MAX_FDS / NUM_REACTORS;
+        ConnectionContext* reaper[NUM_REACTORS][reaped_per_core];
+        int reaper_count[NUM_REACTORS];
+        memset(reaper_count,0,sizeof(reaper_count));
         for(int i = 0; i < MAX_FDS; i++) {
             ConnectionContext* ctx = atomic_load(&context_table[i]);
             if(ctx != NULL) {
@@ -447,11 +451,18 @@ void* connection_reaper_worker(void* arg) {
                         ctx->state = STATE_CLOSE;
                         if(ctx->client_fd != -1) {
                             atomic_fetch_add(&ctx->active_threads, 1);
-                            signal_reactor_task(ctx->reactor_id, ctx);
+                            int r_id = ctx->reactor_id;
+                            reaper[r_id][reaper_count[r_id]++] = ctx;
                         }
                     }
                     pthread_mutex_unlock(&ctx->state_lock);
                 }
+            }
+        }
+
+        for(int i = 0; i < NUM_REACTORS; i++) {
+            if(reaper_count[i] > 0) {
+                signal_reactor_task_bulk(i,reaper[i],reaper_count[i]);
             }
         }
     }
@@ -1266,8 +1277,8 @@ void* worker_reactor_loop(void* args) {
 
     while(server_running) {
         
-        int timeout = (local_stolen_head == NULL) ? 1000 : 0;
-        int n_ready = epoll_wait(epoll_fd,events,EPOLL_BATCH_SIZE,1000);
+        int timeout = (local_stolen_head == NULL) ? 100 : 0;
+        int n_ready = epoll_wait(epoll_fd,events,EPOLL_BATCH_SIZE,timeout);
         if(n_ready == -1) {
             if(errno == EINTR) {
                 continue;

@@ -6,6 +6,8 @@
 #include <stdatomic.h>
 #include"proxy_log.h"
 
+#define NUM_REACTORS sysconf(_SC_NPROCESSORS_ONLN)
+
 typedef struct {
     int port;
     int backlog;

@@ -33,10 +33,10 @@ extern _Atomic(ConnectionContext*) context_table[];
 extern void handle_connect_upstream(ConnectionContext* ctx);
 extern void handle_send_response_headers(ConnectionContext* ctx);
 extern void stash_connection(int fd,char* hostname,int port);
-extern void signal_reactor_task(int target_reactor_id,ConnectionContext* ctx);
+extern void signal_reactor_task_bulk(int target_reactor_id,ConnectionContext** waiters,int count);
 extern _Atomic uint64_t metric_cache_hits;
 extern _Atomic uint64_t metric_cache_misses;
-extern int NUM_REACTORS
+
 
 extern _Atomic uint64_t global_upstream_latency_us;
 extern _Atomic int consecutive_upstream_errors;
@@ -539,8 +539,11 @@ void bypass_cache_for_waiters(char* url,CacheNode* target) {
 
             ConnectionContext* temp_waiters[MAX_WAITERS];
             int temp_num_waiters = current->num_waiters;
+            
+            int waiters_per_core = MAX_WAITERS / NUM_REACTORS;
             ConnectionContext* wakeup_waiters[NUM_REACTORS][waiters_per_core];
-            int waiter_count[MAX_REACTORS] = {0};
+            int waiter_count[NUM_REACTORS];
+            memset(waiter_count,0,sizeof(waiter_count));
 
             for(int i = 0; i < temp_num_waiters; i++) {
                 temp_waiters[i] = current->waiters[i];
@@ -604,7 +607,8 @@ void abort_cache_download(char* url,void* node_ref) {
             int temp_num_waiters = 0;
             int waiters_per_core = MAX_WAITERS / NUM_REACTORS;
             ConnectionContext* wakeup_waiters[NUM_REACTORS][waiters_per_core];
-            int waiter_count[MAX_REACTORS] = {0};
+            int waiter_count[NUM_REACTORS];
+            memset(waiter_count,0,sizeof(waiter_count));
 
             if(current->is_downloading) {
                 temp_num_waiters = current->num_waiters;
@@ -739,7 +743,9 @@ int add_to_cache_ram(ConnectionContext* ctx, char* url, time_t expires_at, time_
             ConnectionContext* temp_waiters[MAX_WAITERS];
             int waiters_per_core = MAX_WAITERS / NUM_REACTORS;
             ConnectionContext* wakeup_waiters[NUM_REACTORS][waiters_per_core];
-            int waiter_count[MAX_REACTORS] = {0};
+            int waiter_count[NUM_REACTORS];
+            memset(waiter_count,0,sizeof(waiter_count));
+
             int temp_num_waiters = current->num_waiters;
             for(int i = 0; i < temp_num_waiters; i++) {
                 temp_waiters[i] = current->waiters[i];
