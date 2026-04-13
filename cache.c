@@ -935,8 +935,7 @@ void handle_check_cache(ConnectionContext* ctx) {
             return;
         }
     }
-    int cork = 1;
-    setsockopt(ctx->client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+    
     //CACHE HIT
     acquire_cache_ref(ctx->cache_ref);
 
@@ -960,6 +959,8 @@ void handle_check_cache(ConnectionContext* ctx) {
         return;
     }
     
+    int cork = 1;
+    setsockopt(ctx->client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
     ctx->write_len = 0;
     ctx->write_offset = 0;
     ctx->write_len += snprintf(ctx->write_buf, sizeof(ctx->write_buf),
@@ -1011,8 +1012,6 @@ void handle_send_cache(ConnectionContext *ctx) {
             atomic_store(&ctx->last_active,time(NULL));
             ctx->send_mem_offset += bytes_sent;
         }
-        int cork = 0;
-        setsockopt(ctx->client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
 
         ctx->send_mem_buf = NULL;
         ctx->send_mem_len = 0;
