@@ -441,37 +441,58 @@ void* expiry_worker(void* arg) {
     }
 }
 
-int parse_cache_policy(char* response_buffer) {
-    int ttl = global_config.default_ttl;// Default TTL
+void parse_upstream_headers(ConnectionContext* ctx,char* body_ptr,int* upstream_dropped_out) {
+    int headers_len = body_ptr - ctx->upstream_header_buf;
+    ctx->cache_ttl = global_config.default_ttl;// Default TTL
     
-    int status_code = 0;
-    if(sscanf(response_buffer,"%*s %d",&status_code) == 1) {
-        if(status_code != 200) {
-            return 0;
+    char copy_buf[BUFFER + 1];
+    int safe_len = (headers_len < BUFFER) ? headers_len : BUFFER;
+    memcpy(copy_buf,ctx->upstream_header_buf,safe_len);
+    copy_buf[safe_len] = '\0';
+    char* save_ptr;
+
+    char* line = strtok_r(copy_buf,"\r\n",&save_ptr);
+
+    if(line) {
+        if(strncmp(line,"HTTP/1.0",8) == 0) *upstream_dropped_out = 1;
+        int status_code = 0;
+        if(sscanf(line,"%*s %d",&status_code) == 1) {
+            if(status_code != 200) {
+                ctx->cache_ttl = 0;
+            }
         }
+        line = strtok_r(NULL,"\r\n",&save_ptr);
     }
     
-    char* cc_header = strcasestr(response_buffer,"Cache-Control:");
-    if(!cc_header) return ttl;
-
-    cc_header = strchr(cc_header,':');
-    if(!cc_header) return ttl;
-
-    cc_header++;
-
-    char* end_of_line = strstr(cc_header,"\r\n");
-    int line_len = end_of_line ? (end_of_line - cc_header) : strlen(cc_header);
-
-    char header_val[256];
-    snprintf(header_val,sizeof(header_val),"%.*s",(line_len < sizeof(header_val) - 1) ? line_len : (int)(sizeof(header_val)) - 1,cc_header);
-    if(strcasestr(header_val,"no-store")  || strcasestr(header_val,"no-cache")  || strcasestr(header_val,"private")) {
-        return 0; // Don't cache
+    while(line) {
+        if(strncasecmp(line,"Content-Length:",15) == 0) {
+            ctx->upstream_content_length = atoi(line + 15);
+        } 
+        else if(strncasecmp(line,"Transfer-Encoding:",18) == 0) {
+            if(strstr(line + 18,"chunked") != NULL) {
+                ctx->is_chunked = 1;
+                ctx->chunk_state = 0;
+                ctx->current_chunk_bytes_read = 0;
+                ctx->hex_idx = 0;
+            }
+        } 
+        else if(strncasecmp(line,"Connection:",11) == 0) {
+            if(strcasestr(line + 11,"close") != NULL) *upstream_dropped_out = 1;
+        } 
+        else if(strncasecmp(line,"Cache-Control:",14) == 0) {
+            char* header_val = line + 14;
+            while(*header_val == ' ') header_val++;
+            if(strcasestr(header_val,"no-store")  || strcasestr(header_val,"no-cache")  || strcasestr(header_val,"private")) {
+                ctx->cache_ttl = 0; // Don't cache
+            } else {
+                char* max_age = strcasestr(header_val,"max-age");
+                if(max_age) {
+                    ctx->cache_ttl = atoi(max_age + 8);
+                }
+            }
+        }
+        line = strtok_r(NULL,"\r\n",&save_ptr);
     }
-    char* max_age = strcasestr(header_val,"max-age");
-    if(max_age) {
-        ttl = atoi(max_age + 8);
-    }
-    return ttl;
 }
 
 int filter_headers_to_buffer(char* header_block,int block_len,char* headers,int offset) {
@@ -1130,22 +1151,7 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
             char* body_ptr = strstr(ctx->upstream_header_buf,"\r\n\r\n");
             if(body_ptr != NULL) {
                 body_ptr += 4;
-                char* cc_length = strcasestr(ctx->upstream_header_buf,"Content-Length:");
-                if(cc_length) ctx->upstream_content_length = atoi(cc_length + 15);
-                
-                char* te_header = strcasestr(ctx->upstream_header_buf,"Transfer-Encoding:");
-                if(te_header && strstr(te_header,"chunked")) {
-                    ctx->is_chunked = 1;
-                    ctx->chunk_state = 0;
-                    ctx->current_chunk_bytes_read = 0;
-                    ctx->hex_idx = 0;
-                }
-                
-                if (strcasestr((ctx->upstream_header_buf), "Connection: close") == 0 || 
-                    strstr(ctx->upstream_header_buf, "HTTP/1.0")) {
-                    upstream_dropped = 1; 
-                }
-                ctx->cache_ttl = parse_cache_policy(ctx->upstream_header_buf);
+                parse_upstream_headers(ctx,body_ptr,&upstream_dropped);
 
                 if(ctx->upstream_content_length > global_config.large_file_threshold) {
                     char cache_file[256],temp_file[300];
