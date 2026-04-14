@@ -1601,6 +1601,15 @@ void rehydrate_cache() {
         if(read(read_fd,&header,sizeof(CacheHeader)) == sizeof(CacheHeader)) {
             if(header.expires_at > time(NULL)) {
                 char hdr_buf[BUFFER];
+
+                // SECURITY GUARD against FORTIFY_SOURCE stack buffer overflow
+                if(header.upstream_header_len > BUFFER || header.upstream_header_len < 0) {
+                    fprintf(stderr, "[rehydrate] Fatal: file header length %d exceeds BUFFER %d! Skipping node.\n", 
+                            header.upstream_header_len, BUFFER);
+                    close(read_fd);
+                    continue;
+                }
+
                 int hdr_len = read(read_fd,hdr_buf,header.upstream_header_len);
                 if(hdr_len > 0 && hdr_len < header.upstream_header_len) {
                     close(read_fd);

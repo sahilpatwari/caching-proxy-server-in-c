@@ -128,7 +128,7 @@ void* telemetry_worker(void* arg) {
             if (last_cpu_time > 0.0) {
                 // If it consumed 0.5 seconds of CPU time in the last 1.0 wall-clock seconds, that is 50% CPU.
                 // Across 12 cores, max is 1200%
-                metric_cpu_usage = (uint64_t)(current_cpu - last_cpu_time) * 10000.0;
+                metric_cpu_usage = (uint64_t)((current_cpu - last_cpu_time) * 10000.0);
             }
             last_cpu_time = current_cpu;
         }
