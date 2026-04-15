@@ -118,6 +118,7 @@ typedef struct CacheNode {
 
     int purged;
     int sync_to_disk;
+    int is_evicted;
 }CacheNode;
 
 static CacheNode* cache_table[CACHE_BUCKETS];
@@ -128,6 +129,12 @@ _Atomic long total_cache_memory = 0;
 static pthread_t expiry_thread;
 static pthread_t persistence_worker_thread;
 static volatile int  cache_running;
+
+static pthread_mutex_t eviction_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t eviction_condition = PTHREAD_COND_INITIALIZER;
+static pthread_t eviction_thread;
+static long eviction_soft_limit = 0;
+static long eviction_target = 0;
 
 static CacheNode* persist_queue[PERSIST_QUEUE_SIZE];
 static int p_head = 0;
@@ -161,14 +168,14 @@ unsigned long hash_url_second(char* url) {
 
 static void approximate_evict_if_needed() {
     //Approximate LRU Logic
-    while(atomic_load(&total_cache_memory) >= (size_t)global_config.max_cache_mem) {
+    unsigned int seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)clock();
+
+    while(atomic_load(&total_cache_memory) >= (size_t)eviction_target) {
         CacheNode* best_victim = NULL;
         int best_bucket = -1;
         time_t oldest_time = time(NULL) + 1;
-        
-        unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)pthread_self();
 
-        for(int i = 0; i < 5; i++) {
+        for(int i = 0; i < 32; i++) {
             int bucket = rand_r(&seed) % CACHE_BUCKETS;
             pthread_rwlock_rdlock(&cache_locks[bucket]);
             CacheNode* current = cache_table[bucket];
@@ -185,36 +192,55 @@ static void approximate_evict_if_needed() {
             }
            pthread_rwlock_unlock(&cache_locks[bucket]);
         }
+        
+        if(best_victim == NULL && best_bucket == -1) break;
 
-        if(best_victim != NULL && best_bucket != -1 && !best_victim->is_downloading && best_victim->ref_count == 0) {
-            pthread_rwlock_wrlock(&cache_locks[best_bucket]);
-            int found = 0;
-            CacheNode* current = cache_table[best_bucket];
-            while(current) {
-                if(current == best_victim) {
-                    found = 1;
-                    break;
-                }
-                current = current->next;
-            }
+        pthread_rwlock_wrlock(&cache_locks[best_bucket]);
 
-            if(found) {
-                long mem_usage = best_victim->memory_usage;
-                atomic_fetch_sub(&total_cache_memory,mem_usage);
-                free(best_victim->response);
-                best_victim->response = NULL;
-                best_victim->response_len = 0;
-                if(!best_victim->sync_to_disk) {
-                    best_victim->is_large = 1;
-                }
-                best_victim->memory_usage = 0;
+        int found = 0;
+        CacheNode* current = cache_table[best_bucket];
+        while(current) {
+            if(current == best_victim) {
+                found = 1;
+                break;
             }
-            pthread_rwlock_unlock(&cache_locks[best_bucket]);
-        } else {
-            break;
+            current = current->next;
         }
+
+        if(found && !best_victim->is_downloading && best_victim->ref_count == 0) {
+            long mem_usage = best_victim->memory_usage;
+            atomic_fetch_sub(&total_cache_memory,mem_usage);
+            free(best_victim->response);
+            best_victim->response = NULL;
+            best_victim->response_len = 0;
+            best_victim->memory_usage = 0;
+            if(best_victim->sync_to_disk) {
+                best_victim->is_large = 1;
+            } else {
+                best_victim->is_evicted = 1;
+            }
+        }
+        pthread_rwlock_unlock(&cache_locks[best_bucket]);
     }
 }
+
+void* eviction_worker(void* args) {
+    pthread_mutex_lock(&eviction_lock);
+    while(cache_running) {
+        while(atomic_load(&total_cache_memory) < eviction_soft_limit && cache_running) {
+            pthread_cond_wait(&eviction_condition,&eviction_lock);
+        }
+        if(!cache_running) break;
+        pthread_mutex_unlock(&eviction_lock);
+
+        approximate_evict_if_needed();
+
+        pthread_mutex_lock(&eviction_lock);
+    }
+    pthread_mutex_unlock(&eviction_lock);
+    return NULL;    
+}
+
 void init_cache() {
     for(int i = 0; i < CACHE_BUCKETS; i++) {
         cache_table[i] = NULL;
@@ -223,8 +249,11 @@ void init_cache() {
     atomic_store(&total_cache_memory,0);
     
     cache_running = 1;
+    eviction_soft_limit = global_config.max_cache_mem * 0.8;
+    eviction_target = global_config.max_cache_mem * 0.65;
     pthread_create(&expiry_thread,NULL,expiry_worker,NULL);
     pthread_create(&persistence_worker_thread,NULL,persistence_worker,NULL);
+    pthread_create(&eviction_thread,NULL,eviction_worker,NULL);
 }
 
 void destroy_cache() {
@@ -235,6 +264,10 @@ void destroy_cache() {
     pthread_cond_broadcast(&p_notify);
     pthread_cancel(persistence_worker_thread);
     pthread_join(persistence_worker_thread,NULL);
+
+    pthread_cond_broadcast(&eviction_condition);
+    pthread_cancel(eviction_thread);
+    pthread_join(eviction_thread,NULL);
 
     for(int i = 0; i < CACHE_BUCKETS; i++) {
         pthread_rwlock_wrlock(&cache_locks[i]);
@@ -702,8 +735,6 @@ int add_to_cache_ram(ConnectionContext* ctx, char* url, time_t expires_at, time_
     unsigned long hash = hash_url(url);
     int bucket = hash % CACHE_BUCKETS;
     
-    approximate_evict_if_needed();
-    
     if(ctx == NULL) {
         current = cache_table[bucket];
         while(current != NULL) {
@@ -721,7 +752,8 @@ int add_to_cache_ram(ConnectionContext* ctx, char* url, time_t expires_at, time_
             current->body_size = body_size;
             current->upstream_header_len = upstream_header_len;
             current->is_downloading = 0;
-
+            current->is_evicted = 0;
+            
             free(current->response);
             current->response = NULL;
             current->response_len = 0;
@@ -756,6 +788,13 @@ int add_to_cache_ram(ConnectionContext* ctx, char* url, time_t expires_at, time_
                 pthread_mutex_unlock(&p_lock);
                atomic_store(&current->last_accessed,time(NULL));
                atomic_fetch_add(&total_cache_memory,current->memory_usage);
+               
+               pthread_mutex_lock(&eviction_lock);
+               if(atomic_load(&total_cache_memory) >= eviction_soft_limit) {
+                   pthread_cond_signal(&eviction_condition);
+               }
+               pthread_mutex_unlock(&eviction_lock);
+
             } else {
                 current->is_large = 1;
                 current->memory_usage = 0;
@@ -850,7 +889,7 @@ int check_cache_ram(ConnectionContext* ctx) {
                         pthread_rwlock_unlock(&cache_locks[bucket]);
                         atomic_fetch_add(&metric_cache_hits,1);
                         return 1; // Cache Hit
-                } else {
+                } else if(current->is_large) {
                     ctx->bytes_remaining = current->body_size;
                     ctx->upstream_header_len = current->upstream_header_len;
                     ctx->send_mem_buf = NULL;
@@ -897,9 +936,19 @@ int check_cache_ram(ConnectionContext* ctx) {
                 current->memory_usage = 0;
                 
                 ctx->cache_ref = current;
+                ctx->is_designated_downloader = 1;
                 atomic_fetch_add(&metric_cache_misses,1);
                 pthread_rwlock_unlock(&cache_locks[bucket]);
                 return -1; // Expired
+            } else if(current->is_evicted) {
+                current->is_downloading = 1;
+                current->num_waiters = 1;
+                ctx->cache_ref = current;
+                ctx->is_designated_downloader = 1;
+                current->is_evicted = 0;
+                atomic_fetch_add(&metric_cache_misses,1);
+                pthread_rwlock_unlock(&cache_locks[bucket]);
+                return -1;
             }
        } 
        prev = current;
@@ -1445,6 +1494,7 @@ void handle_fetch_upstream(ConnectionContext* ctx) {
             }
             int cache_status = add_to_cache_ram(ctx,ctx->url, finalHeader.expires_at,finalHeader.cached_at,file_buf, ctx->upstream_header_len,body_buf, body_size);
             if(cache_status <= 0) {
+                close(read_fd);
                 ctx->state = STATE_CLOSE;
                 return;
             }
