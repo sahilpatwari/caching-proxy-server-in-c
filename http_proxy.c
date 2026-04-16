@@ -510,28 +510,39 @@ void handle_send_upstream(ConnectionContext* ctx) {
         ,ctx->method,(ctx->req).path,ctx->protocol,(ctx->req).hostname);
 
         ctx->write_offset = 0;
-        char *buffer_ptr;
-        char headers_copy[BUFFER + 1];
-        char* end_of_headers = strstr(ctx->read_buf,"\r\n\r\n");
-        if(end_of_headers) {
-            int header_len = end_of_headers - ctx->read_buf;
-            memcpy(headers_copy,ctx->read_buf,header_len);
-            headers_copy[header_len] = '\0';
-        } else {
-            strncpy(headers_copy,ctx->read_buf,BUFFER);
-            headers_copy[BUFFER] ='\0';
-        }
+        char* p = (char*)memchr(ctx->read_buf,'\n',ctx->bytes_read);
+        if(!p) goto append_terminator;
+        p++;
 
-        char *token = strtok_r(headers_copy,"\r\n",&buffer_ptr);
-        while(token != NULL) {
-            if(strncmp(token,ctx->method,strlen(ctx->method)) == 0 || strncmp(token,"Host",4) == 0 || strncmp(token,"Connection",10) == 0) {
-                token = strtok_r(NULL,"\r\n",&buffer_ptr);
+        char* buf_end = ctx->read_buf + ctx->bytes_read;
+        while(p < buf_end) {
+            char* line_end = (char*)memchr(p,'\r',buf_end - p);
+            if(!line_end || line_end + 1 >= buf_end || *(line_end + 1) != '\n') break;
+
+            int line_len = line_end - p;
+            if(line_len == 0) break;
+
+            if(strncasecmp(p,"Host:",5) == 0 || strncasecmp(p,"Connection:",11) == 0) {
+                p = line_end + 2;
                 continue;
             }
-            ctx->write_len += snprintf(ctx->write_buf + ctx->write_len,sizeof(ctx->write_buf) - ctx->write_len,"%s\r\n",token);
-            token = strtok_r(NULL,"\r\n",&buffer_ptr);
+
+            if(ctx->write_len + line_len + 2 < (int)sizeof(ctx->write_buf)) {
+                memcpy(ctx->write_buf + ctx->write_len, p, line_len);
+                ctx->write_buf[ctx->write_len + line_len] = '\r';
+                ctx->write_buf[ctx->write_len + line_len + 1] = '\n';
+                ctx->write_len += line_len + 2;
+            }
+
+            p = line_end + 2;
         }
-        ctx->write_len += snprintf(ctx->write_buf + ctx->write_len,sizeof(ctx->write_buf) - ctx->write_len,"\r\n");
+        
+        append_terminator:
+        
+        if(ctx->write_len + 2 <= sizeof(ctx->write_buf)) {
+             ctx->write_buf[ctx->write_len++] = '\r';
+             ctx->write_buf[ctx->write_len++] = '\n';
+        }
     }
 
     while(ctx->write_offset < ctx->write_len) {
