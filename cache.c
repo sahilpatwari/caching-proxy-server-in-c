@@ -180,7 +180,7 @@ static void approximate_evict_if_needed() {
             pthread_rwlock_rdlock(&cache_locks[bucket]);
             CacheNode* current = cache_table[bucket];
             while(current) {
-                if(!current->is_downloading && current->response != NULL && current->ref_count == 0) {
+                if(!current->is_large && !current->is_downloading && current->response != NULL && current->ref_count == 0) {
                     time_t acc = atomic_load(&current->last_accessed);
                     if(acc < oldest_time) {
                         oldest_time = acc;
@@ -403,7 +403,7 @@ void* persistence_worker(void* arg) {
                 int data_len = 0;
                 while(data_len < target->response_len) {
                     int n = (target->response_len - data_len) > BUFFER ? BUFFER : (target->response_len - data_len);
-                    int bytes_written = write(fd,target->response,n);
+                    int bytes_written = write(fd,target->response + data_len,n);
                     if(bytes_written < 0) {
                         close(fd);
                         unlink(temp_file);
@@ -852,8 +852,8 @@ int check_cache_ram(ConnectionContext* ctx) {
                     ctx->cached_at = current->cached_at;
                     ctx->cache_ref = current;
                     atomic_store(&current->last_accessed,time(NULL));
-                    atomic_fetch_add(&metric_cache_hits,1);
                     pthread_rwlock_unlock(&cache_locks[bucket]);
+                    atomic_fetch_add(&metric_cache_hits,1);
                     return 1; // Cache Hit
                 } else if(current->is_large) {
                     ctx->bytes_remaining = current->body_size;
@@ -861,8 +861,8 @@ int check_cache_ram(ConnectionContext* ctx) {
                     ctx->send_mem_buf = NULL;
                     ctx->cached_at = current->cached_at;
                     ctx->cache_ref = current;
-                    atomic_fetch_add(&metric_cache_hits,1);
                     pthread_rwlock_unlock(&cache_locks[bucket]);
+                    atomic_fetch_add(&metric_cache_hits,1);
                     return 1; // Cache Hit
                 }
             }
@@ -885,17 +885,17 @@ int check_cache_ram(ConnectionContext* ctx) {
                         ctx->send_mem_offset = current->response_len - current->body_size;
                         ctx->cached_at = current->cached_at;
                         ctx->cache_ref = current;
+                        atomic_fetch_add(&metric_cache_hits,1);
                         atomic_store(&current->last_accessed,time(NULL));
                         pthread_rwlock_unlock(&cache_locks[bucket]);
-                        atomic_fetch_add(&metric_cache_hits,1);
                         return 1; // Cache Hit
                 } else if(current->is_large) {
                     ctx->bytes_remaining = current->body_size;
                     ctx->upstream_header_len = current->upstream_header_len;
                     ctx->send_mem_buf = NULL;
                     ctx->cache_ref = current;
-                    pthread_rwlock_unlock(&cache_locks[bucket]);
                     atomic_fetch_add(&metric_cache_hits,1);
+                    pthread_rwlock_unlock(&cache_locks[bucket]);
                     return 1; // Cache Hit
                 }
             }
@@ -1005,6 +1005,9 @@ void handle_check_cache(ConnectionContext* ctx) {
         } else if(isHit == -1) {
             ctx->state = STATE_WAIT_CACHE;
             return;
+        } else {
+            //CACHE HIT
+
         }
     }
     

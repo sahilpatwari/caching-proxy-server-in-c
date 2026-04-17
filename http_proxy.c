@@ -118,7 +118,7 @@ void* telemetry_worker(void* arg) {
     double last_cpu_time = 0.0;
     long page_size = sysconf(_SC_PAGESIZE); // Usually 4096 bytes
 
-    while(1) { 
+    while(server_running) { 
         // 1. HARDWARE-ACCURATE CPU USAGE (Nanosecond Precision)
         struct timespec ts;
         if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) == 0) {
