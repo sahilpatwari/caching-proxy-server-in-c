@@ -26,6 +26,7 @@
 #define MAX_WAITERS          8192
 #define PERSIST_QUEUE_SIZE   8192
 #define PERSIST_BATCH_SIZE   1024
+#define GRACE_WINDOW 30
 extern _Atomic int active_upstream_connections;
 
 extern __thread int epoll_fd;
@@ -119,6 +120,9 @@ typedef struct CacheNode {
     int purged;
     int sync_to_disk;
     int is_evicted;
+
+    char etag[128];
+    int revalidating;
 }CacheNode;
 
 static CacheNode* cache_table[CACHE_BUCKETS];
@@ -656,7 +660,7 @@ void abort_cache_download(char* url,void* node_ref) {
     CacheNode* target = (CacheNode*)node_ref;
     CacheNode* prev = NULL;
     while(current != NULL) {
-        if(current == target) {
+        if(strcmp(current->url,url) == 0) {
             ConnectionContext* temp_waiters[MAX_WAITERS];
             int temp_num_waiters = 0;
             int waiters_per_core = MAX_WAITERS / NUM_REACTORS;
@@ -671,18 +675,30 @@ void abort_cache_download(char* url,void* node_ref) {
                 }
                 current->num_waiters = 0;
             }
-
-            if(prev == NULL) {
-                cache_table[bucket] = current->next;
+            
+            if(current == target) {
+                if(prev == NULL) {
+                    cache_table[bucket] = current->next;
+                } else {
+                    prev->next = current->next;
+                }
             } else {
-                prev->next = current->next;
+                current->is_downloading = 0;
+                current->revalidating = 0;
             }
 
             pthread_rwlock_unlock(&cache_locks[bucket]);
-            free(current->response);
-            current->response = NULL;
-            free(current);
-            current = NULL;
+            if(current == target) {
+                free(current->response);
+                current->response = NULL;
+                free(current);
+                current = NULL;
+            } else {
+                free(target->response);
+                target->response = NULL;
+                free(target);
+                target = NULL;
+            }
             node_ref = NULL;
             for(int i = 0; i < temp_num_waiters; i++) {
                 ConnectionContext* waiter = temp_waiters[i];
@@ -710,10 +726,6 @@ void abort_cache_download(char* url,void* node_ref) {
                     signal_reactor_task_bulk(i,wakeup_waiters[i],waiter_count[i]);
                 }
             }
-
-            char cache_file[256];
-            get_cache_filename(url,cache_file);
-            unlink(cache_file);
             return;
         } 
         prev = current;
@@ -743,8 +755,43 @@ int add_to_cache_ram(ConnectionContext* ctx, char* url, time_t expires_at, time_
             }
             current = current->next;
         }
+        pthread_rwlock_wrlock(&cache_locks[bucket]);
+    }  else {
+        if(current->revalidating) {
+            pthread_rwlock_wrlock(&cache_locks[bucket]);
+            CacheNode* node = cache_table[bucket];
+            CacheNode* prev = NULL;
+            while(node != NULL) {
+                if(strcmp(node->url,url) == 0) {
+                    break;
+                }
+                prev = node;
+                node = node->next;
+            }
+            
+            if(prev == NULL) cache_table[bucket] = node->next;
+            else prev->next = node->next;
+            
+            current->num_waiters = node->num_waiters;
+            for(int i = 0; i < node->num_waiters; i++) {
+                current->waiters[i] = node->waiters[i];
+            }
+            node->num_waiters = 0;
+            current->next = cache_table[bucket];
+            cache_table[bucket] = current;
+
+            if(node->ref_count > 0) {
+                node->purged = 1;
+            } else {
+                free(node->response);
+                node->response = NULL;
+                free(node);
+                node = NULL;
+            }
+        } else {
+            pthread_rwlock_wrlock(&cache_locks[bucket]);
+        }
     }
-    pthread_rwlock_wrlock(&cache_locks[bucket]);
     
     if(current != NULL) {
             current->expires_at = expires_at;
@@ -836,6 +883,47 @@ int add_to_cache_ram(ConnectionContext* ctx, char* url, time_t expires_at, time_
     return -1;
 }
 
+int serve_cache_hit(ConnectionContext* ctx, CacheNode* current) {
+    if(!current->is_large && current->response != NULL) {
+        ctx->send_mem_buf = current->response;
+        ctx->send_mem_len = current->response_len;
+        ctx->send_mem_offset = current->response_len - current->body_size;
+        ctx->cached_at = current->cached_at;
+        ctx->cache_ref = current;
+        atomic_store(&current->last_accessed,time(NULL));
+        atomic_fetch_add(&metric_cache_hits,1);
+        return 1; // Cache Hit
+    } else if(current->is_large) {
+        ctx->bytes_remaining = current->body_size;
+        ctx->upstream_header_len = current->upstream_header_len;
+        ctx->send_mem_buf = NULL;
+        ctx->cached_at = current->cached_at;
+        ctx->cache_ref = current;
+        atomic_fetch_add(&metric_cache_hits,1);
+        return 1; // Cache Hit
+    }
+    return 0; // Cache Miss
+}
+
+int allocate_cache_node(ConnectionContext* ctx,int bucket) {
+    CacheNode* new_node = calloc(1,sizeof(CacheNode));
+    if(!new_node) {
+        pthread_rwlock_unlock(&cache_locks[bucket]);
+        return 0;
+    }
+    strncpy(new_node->url,ctx->url,sizeof(new_node->url) - 1);
+    new_node->url[sizeof(new_node->url) - 1] = '\0';
+    new_node->is_downloading = 1;
+    new_node->expires_at = 0;
+    new_node->upstream_header_len = 0;
+    new_node->is_large = 0;
+    new_node->num_waiters = 0;
+    new_node->purged = 0;
+    new_node->revalidating = 0;
+    ctx->cache_ref = new_node;
+    return 1;
+}
+
 int check_cache_ram(ConnectionContext* ctx) {
     unsigned long hash = hash_url(ctx->url);
     int bucket = hash % CACHE_BUCKETS;
@@ -845,25 +933,16 @@ int check_cache_ram(ConnectionContext* ctx) {
     while(current != NULL) {
         if(strcmp(ctx->url,current->url) == 0) {
             if(!current->is_downloading && current->expires_at > time(NULL) ) {
-                if(!current->is_large && current->response != NULL) {
-                    ctx->send_mem_buf = current->response;
-                    ctx->send_mem_len = current->response_len;
-                    ctx->send_mem_offset = current->response_len - current->body_size;
-                    ctx->cached_at = current->cached_at;
-                    ctx->cache_ref = current;
-                    atomic_store(&current->last_accessed,time(NULL));
+                if(serve_cache_hit(ctx,current) == 1) {
                     pthread_rwlock_unlock(&cache_locks[bucket]);
-                    atomic_fetch_add(&metric_cache_hits,1);
-                    return 1; // Cache Hit
-                } else if(current->is_large) {
-                    ctx->bytes_remaining = current->body_size;
-                    ctx->upstream_header_len = current->upstream_header_len;
-                    ctx->send_mem_buf = NULL;
-                    ctx->cached_at = current->cached_at;
-                    ctx->cache_ref = current;
-                    pthread_rwlock_unlock(&cache_locks[bucket]);
-                    atomic_fetch_add(&metric_cache_hits,1);
-                    return 1; // Cache Hit
+                    return 1; //Cache Hit
+                }
+            } else if(current->is_downloading) {
+                if(current->revalidating && time(NULL) < current->expires_at + GRACE_WINDOW) {
+                    if(serve_cache_hit(ctx,current) == 1) {
+                        pthread_rwlock_unlock(&cache_locks[bucket]);
+                        return 1; //Stale Cache Hit
+                    }
                 }
             }
             break;
@@ -879,28 +958,20 @@ int check_cache_ram(ConnectionContext* ctx) {
        if(strcmp(ctx->url,current->url) == 0) {
             //Recheck in write lock
             if(!current->is_downloading && current->expires_at > time(NULL) ) {
-                if(!current->is_large && current->response != NULL) {
-                        ctx->send_mem_buf = current->response;
-                        ctx->send_mem_len = current->response_len;
-                        ctx->send_mem_offset = current->response_len - current->body_size;
-                        ctx->cached_at = current->cached_at;
-                        ctx->cache_ref = current;
-                        atomic_fetch_add(&metric_cache_hits,1);
-                        atomic_store(&current->last_accessed,time(NULL));
-                        pthread_rwlock_unlock(&cache_locks[bucket]);
-                        return 1; // Cache Hit
-                } else if(current->is_large) {
-                    ctx->bytes_remaining = current->body_size;
-                    ctx->upstream_header_len = current->upstream_header_len;
-                    ctx->send_mem_buf = NULL;
-                    ctx->cache_ref = current;
-                    atomic_fetch_add(&metric_cache_hits,1);
+                if(serve_cache_hit(ctx,current) == 1) {
                     pthread_rwlock_unlock(&cache_locks[bucket]);
-                    return 1; // Cache Hit
+                    return 1; //Cache Hit
                 }
             }
 
             if(current->is_downloading) {
+                if(current->revalidating && time(NULL) < current->expires_at + GRACE_WINDOW) {
+                    if(serve_cache_hit(ctx,current) == 1) {
+                        pthread_rwlock_unlock(&cache_locks[bucket]);
+                        return 1; //Stale Cache Hit
+                    }
+                }
+
                 if(current->num_waiters < MAX_WAITERS) {
                     current->waiters[current->num_waiters++] = ctx;
                     atomic_fetch_add(&ctx->active_threads,1);
@@ -913,36 +984,25 @@ int check_cache_ram(ConnectionContext* ctx) {
             }
 
             if(current->expires_at < time(NULL)) {
-
-                if(current->ref_count > 0) {
-                    current->purged = 1;
-
-                    if(prev == NULL) cache_table[bucket] = current->next;
-                    else prev->next = current->next;
-                    current->next = NULL;
-
-                    break;
-                }
                 current->is_downloading = 1;
+                current->revalidating = 1;
                 current->num_waiters = 0;
 
                 if(current->memory_usage > 0) {
                     atomic_fetch_sub(&total_cache_memory,current->memory_usage);
                 }
-
-                free(current->response);
-                current->response = NULL;
-                current->response_len = 0;
-                current->memory_usage = 0;
                 
-                ctx->cache_ref = current;
+                if(allocate_cache_node(ctx,bucket) == 0) return 0;
+                CacheNode* new_node = (CacheNode*)ctx->cache_ref;
+                new_node->revalidating = 1;
                 ctx->is_designated_downloader = 1;
                 atomic_fetch_add(&metric_cache_misses,1);
                 pthread_rwlock_unlock(&cache_locks[bucket]);
                 return -1; // Expired
             } else if(current->is_evicted) {
                 current->is_downloading = 1;
-                current->num_waiters = 1;
+                current->revalidating = 0;
+                current->num_waiters = 0;
                 ctx->cache_ref = current;
                 ctx->is_designated_downloader = 1;
                 current->is_evicted = 0;
@@ -955,22 +1015,10 @@ int check_cache_ram(ConnectionContext* ctx) {
        current = current->next;
     }
 
-    CacheNode* new_node = calloc(1,sizeof(CacheNode));
-    if(!new_node) {
-        pthread_rwlock_unlock(&cache_locks[bucket]);
-        return 0;
-    }
-    strncpy(new_node->url,ctx->url,sizeof(new_node->url) - 1);
-    new_node->url[sizeof(new_node->url) - 1] = '\0';
-    new_node->is_downloading = 1;
-    new_node->expires_at = 0;
-    new_node->upstream_header_len = 0;
-    new_node->is_large = 0;
-    new_node->num_waiters = 0;
-    new_node->purged = 0;
+    if(allocate_cache_node(ctx,bucket) == 0) return 0;
+    CacheNode* new_node = (CacheNode*)ctx->cache_ref;
     new_node->next = cache_table[bucket];
     cache_table[bucket] = new_node;
-    ctx->cache_ref = new_node;
     
     ctx->is_designated_downloader = 1;
     atomic_fetch_add(&metric_cache_misses,1);

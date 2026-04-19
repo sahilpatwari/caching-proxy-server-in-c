@@ -130,6 +130,8 @@ typedef struct ConnectionContext {
     struct ConnectionContext* next_task; // For the Reactor's linked-list work queue
     uint32_t client_interests;   // Track currently registered client events
     uint32_t upstream_interests; // Track currently registered upstream events
+
+    char etag[128];
 } ConnectionContext;
 
 typedef struct ConnectionNode {
