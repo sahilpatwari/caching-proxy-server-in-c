@@ -131,7 +131,9 @@ typedef struct ConnectionContext {
     uint32_t client_interests;   // Track currently registered client events
     uint32_t upstream_interests; // Track currently registered upstream events
 
-    char etag[128];
+    char etag[256];
+    char client_if_none_match[256];
+    int revalidating;
 } ConnectionContext;
 
 typedef struct ConnectionNode {

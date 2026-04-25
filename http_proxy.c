@@ -64,15 +64,16 @@ _Atomic long metric_memory_rss_kb = 0;
 extern long total_cache_memory;
 time_t server_start_time;
 
-static struct upstream_config {
+typedef struct UpstreamConfig {
     char hostname[256];
     int port;
     struct sockaddr_storage resolved_addr;
     socklen_t resolved_addr_len;
     int is_resolved;
     pthread_rwlock_t dns_lock;
-}upstream_config;
+}UpstreamConfig;
 
+static UpstreamConfig upstream_config;
 //EPOLL INSTANCE
 __thread int epoll_fd;
 HostBucket connection_map[POOL_BUCKETS];
@@ -375,6 +376,8 @@ ConnectionContext* create_context(int fd) {
     ctx->req.hostname[0] = '\0';
     ctx->req.port = 0;
     ctx->req.path[0] = '\0';
+    ctx->etag[0] = '\0';
+    ctx->client_if_none_match[0] = '\0';
     ctx->client_interests = 0;
     ctx->upstream_interests = 0;
     atomic_store(&context_table[fd],ctx);
@@ -508,7 +511,11 @@ void handle_send_upstream(ConnectionContext* ctx) {
         ctx->write_len = snprintf(ctx->write_buf,sizeof(ctx->write_buf),
         "%s %s %s\r\nHost: %s\r\nConnection: keep-alive\r\n"
         ,ctx->method,(ctx->req).path,ctx->protocol,(ctx->req).hostname);
-
+        
+        if(ctx->revalidating == 1 && strlen(ctx->etag) > 0) {
+            ctx->write_len += snprintf(ctx->write_buf + ctx->write_len,sizeof(ctx->write_buf) - ctx->write_len,
+                             "If-None-Match: %s",ctx->etag);
+        }
         ctx->write_offset = 0;
         char* p = (char*)memchr(ctx->read_buf,'\n',ctx->bytes_read);
         if(!p) goto append_terminator;
@@ -522,7 +529,7 @@ void handle_send_upstream(ConnectionContext* ctx) {
             int line_len = line_end - p;
             if(line_len == 0) break;
 
-            if(strncasecmp(p,"Host:",5) == 0 || strncasecmp(p,"Connection:",11) == 0) {
+            if(strncasecmp(p,"Host:",5) == 0 || strncasecmp(p,"Connection:",11) == 0 || strncasecmp(p,"If-None-Match:",14) == 0) {
                 p = line_end + 2;
                 continue;
             }
@@ -615,6 +622,7 @@ void handle_connect_upstream(ConnectionContext* ctx) {
     }
 
     strncpy((ctx->req).hostname,upstream_config.hostname,sizeof((ctx->req).hostname) - 1);
+    (ctx->req).hostname[sizeof((ctx->req).hostname) - 1] = '\0';
     (ctx->req).port = upstream_config.port;
     strncpy((ctx->req).path, ctx->url, sizeof((ctx->req).path) - 1);
     (ctx->req).path[sizeof((ctx->req).path) - 1] = '\0';
@@ -732,19 +740,47 @@ void handle_parse_request(ConnectionContext* ctx) {
         return;
     }
     
-    if(strstr(ctx->protocol,"HTTP/1.0") != NULL && strstr(ctx->read_buf,"Connection: Keep-Alive") == NULL) {
+    if(strstr(ctx->protocol,"HTTP/1.0") != NULL) {
         ctx->keep_alive = 0;
     }
-    else if(strstr(ctx->read_buf,"Connection:close") || strstr(ctx->read_buf,"Connection: close")) {
-        ctx->keep_alive = 0;
-    } else {
-        ctx->keep_alive = 1;
-    }
+    
+    char* p = (char*)memchr(ctx->read_buf,'\n',ctx->bytes_read);
+    if(p != NULL) {
+        p++;
+        char* buf_end = ctx->read_buf + ctx->bytes_read;
+        while(p < buf_end) {
+            char* line_end = (char*)memchr(p,'\r',buf_end - p);
+            if(!line_end || line_end + 1 >= buf_end || *(line_end + 1) != '\n') break;
 
+            int line_len = line_end - p;
+            if(line_len == 0) break;
+            if(strncasecmp(p,"Connection:",11) == 0) {
+                char* val = p + 11;
+                while(*val == ' ') val++;
+                if(strncasecmp(val,"close",5) == 0) ctx->keep_alive = 0;
+                else if(strncasecmp(val,"Keep-Alive",10) == 0) ctx->keep_alive = 1;
+
+            }
+
+            if(strncasecmp(p,"If-None-Match:",14) == 0) {
+                char* val = p + 14;
+                while(*val == ' ') val++;
+                char* start = val;
+
+                int len = line_len;
+                if(len >= sizeof(ctx->client_if_none_match) - 1) len = sizeof(ctx->client_if_none_match) - 1;
+                strncpy(ctx->client_if_none_match,start,len);
+                ctx->client_if_none_match[len] = '\0';
+            } 
+
+            p = line_end + 2;
+        }
+    }
+    
     //printf("[Proxy] Request: %s %s\n", method, url);
     if (global_config.log_level == LEVEL_INFO) {
         char log_buf[1536];
-        snprintf(log_buf, sizeof(log_buf), "Request: %s %s:%d", ctx->method, (ctx->req).hostname, (ctx->req).port);
+        snprintf(log_buf, sizeof(log_buf), "Request: %s %s:%d", ctx->method, upstream_config.hostname, upstream_config.port);
         log_event(LEVEL_INFO, ctx->req_id, ctx->client_ip, log_buf);
     }
     
@@ -1107,6 +1143,7 @@ void* handle_state_machine(void* args) {
 
 int resolve_origin_dns(const char* hostname,const char* port_str) {
     strncpy(upstream_config.hostname,hostname,sizeof(upstream_config.hostname) - 1);
+    upstream_config.hostname[sizeof(upstream_config.hostname) - 1] = '\0';
 
     upstream_config.port = atoi(port_str);
     upstream_config.is_resolved = 0;
@@ -1441,7 +1478,6 @@ int main(int argc,char* argv[]) {
     init_connection_pool();
     init_cache();
     init_context_pool();
-    init_registry();
     rehydrate_cache();
 
     printf("Server is listening\n");
