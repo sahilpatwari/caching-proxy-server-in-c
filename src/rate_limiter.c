@@ -7,6 +7,7 @@
 #include<netinet/in.h>
 #include "proxy.h"
 #include "rate_limiter.h"
+#include"config.h"
 
 #define HASH_TABLE_SIZE 4096
 

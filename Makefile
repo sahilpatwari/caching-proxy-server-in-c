@@ -1,35 +1,40 @@
 CC = gcc
-CFLAGS = -O3 -D_GNU_SOURCE
+CFLAGS = -O3 -D_GNU_SOURCE -Iinclude
 LDFLAGS = -lpthread
-TARGET = custom_proxy_cache
+TARGET = build/custom_proxy_cache
 
 # Source files
-SRCS = http_proxy.c cache.c  proxy_log.c rate_limiter.c  errors.c config.c
+SRCS = src/main.c src/cache.c  src/proxy_log.c src/rate_limiter.c src/config.c src/reactor.c src/connection_context.c \
+       src/upstream.c src/http_handler.c src/workers.c
 
 # Object files
-OBJS = $(SRCS:.c=.o)
+OBJS = $(SRCS:src/%.c=build/%.o)
 
 .PHONY: all clean debug install
 
 # Default build
-all: $(TARGET)
+all: build $(TARGET)
 
 # Build the proxy
+build:
+	mkdir -p build
+
+
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS)
 
 # Compile C files into object files
-%.o: %.c
+build/%.o: src/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Debug build with sanitizers and no optimization
-debug: CFLAGS = -Wall -Wextra -g -O0 -fsanitize=address -D_GNU_SOURCE
+debug: CFLAGS = -Wall -Wextra -g -O0 -fsanitize=address -D_GNU_SOURCE -Iinclude
 debug: LDFLAGS += -fsanitize=address
-debug: clean $(TARGET)
+debug: clean all
 
 # Clean build artifacts
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -rf build/
 
 # Simple install target (optional)
 install: $(TARGET)

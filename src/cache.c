@@ -1,59 +1,29 @@
-#define _GNU_SOURCE
-
 #include<stdio.h>
 #include<stdlib.h>
-#include<sys/stat.h>
 #include<string.h>
 #include<time.h>
+#include<stdint.h>
 #include<sys/time.h>
 #include<dirent.h>
-#include<sys/socket.h>
-#include<stdint.h>
-#include<sys/sendfile.h>
-#include<sys/types.h>
 #include<unistd.h>
-#include<errno.h>
 #include<fcntl.h>
-#include<sys/epoll.h>
-#include<netdb.h>
-#include<arpa/inet.h>
-#include<netinet/tcp.h>
-#include<sys/mman.h>
+
+
+#include"proxy.h"
 #include"cache.h"
-#include"thread_pool.h"
+#include"config.h"
+#include"connection.h"
+#include"reactor.h"
+#include"workers.h"
 
 #define CACHE_BUCKETS        8192
 #define MAX_WAITERS          8192
 #define PERSIST_QUEUE_SIZE   8192
 #define PERSIST_BATCH_SIZE   1024
 #define GRACE_WINDOW 30
-extern _Atomic int active_upstream_connections;
 
-extern __thread int epoll_fd;
-extern _Atomic(ConnectionContext*) context_table[];
-extern void handle_connect_upstream(ConnectionContext* ctx);
-extern void handle_send_response_headers(ConnectionContext* ctx);
-extern void stash_connection(int fd,char* hostname,int port);
-extern void signal_reactor_task_bulk(int target_reactor_id,ConnectionContext** waiters,int count);
-extern _Atomic uint64_t metric_cache_hits;
-extern _Atomic uint64_t metric_cache_misses;
-
-
-extern _Atomic uint64_t global_upstream_latency_us;
-extern _Atomic int consecutive_upstream_errors;
-
-extern Reactor* global_reactors;
 void* expiry_worker(void*);
 void* persistence_worker(void*);
-
-typedef struct {
-    time_t expires_at;
-    time_t cached_at;
-    long content_length;
-    int upstream_header_len;
-    char url[512];
-    char etag[256];
-}CacheHeader;
 
 
 typedef struct CacheNode {
@@ -132,6 +102,31 @@ unsigned long hash_url_second(char* url) {
     }
     return hash;
 }
+
+static char* build_response(char* upstream_headers,int upstream_header_len,char* body,long body_size, long* out_len) {
+    char hdr_buffer[BUFFER];
+    
+    int hdr_len = snprintf(hdr_buffer,sizeof(hdr_buffer),
+        "HTTP/1.1 200 OK\r\n"
+        "Connection: keep-alive\r\n"
+        "Content-Length: %ld\r\n"
+        "Via: 1.1 caching-proxy\r\n",body_size);
+
+    if (upstream_header_len > 0) {
+        memcpy(hdr_buffer + hdr_len, upstream_headers, upstream_header_len);
+        hdr_len += upstream_header_len;
+    }
+
+    long total = hdr_len + body_size;
+    char* resp = malloc(total + 1);
+    if(!resp) return NULL;
+
+    memcpy(resp,hdr_buffer,hdr_len);
+    memcpy(resp + hdr_len,body,body_size);
+    *out_len = total;
+    return resp;
+}
+
 
 static void approximate_evict_if_needed() {
     //Approximate LRU Logic
@@ -250,10 +245,10 @@ void destroy_cache() {
     }
 }
 
-void get_cache_filename(char* url,char* buffer) {
-    unsigned long hash= hash_url(url);
+void get_cache_filename(char* url, char* buffer) {
+    unsigned long hash = hash_url(url);
     unsigned long hash_second = hash_url_second(url);
-    sprintf(buffer,"cache/%lu.%lu",hash,hash_second);
+    snprintf(buffer, 256, "cache/%lu.%lu", hash, hash_second);
 }
 
 void acquire_cache_ref(void* ref) {
@@ -265,8 +260,8 @@ void acquire_cache_ref(void* ref) {
 void release_cache_ref(void* ref) {
     if(ref == NULL) return;
     CacheNode* node = (CacheNode*)ref;
-    atomic_fetch_sub(&node->ref_count,1);
-    if(node->ref_count == 0 && node->purged) {
+    int old = atomic_fetch_sub(&node->ref_count,1);
+    if(old == 1 && node->purged) {
         free(node->response);
         node->response = NULL;
         free(node);
@@ -398,130 +393,13 @@ void* expiry_worker(void* arg) {
     return NULL;
 }
 
-int parse_upstream_headers(ConnectionContext* ctx,char* body_ptr,int* upstream_dropped_out) {
-    int headers_len = body_ptr - ctx->upstream_header_buf;
-    ctx->cache_ttl = global_config.default_ttl;// Default TTL
-    
-    char copy_buf[BUFFER + 1];
-    int safe_len = (headers_len < BUFFER) ? headers_len : BUFFER;
-    memcpy(copy_buf,ctx->upstream_header_buf,safe_len);
-    copy_buf[safe_len] = '\0';
-    char* save_ptr;
-
-    char* line = strtok_r(copy_buf,"\r\n",&save_ptr);
-
-    if(line) {
-        if(strncmp(line,"HTTP/1.0",8) == 0) *upstream_dropped_out = 1;
-        int status_code = 0;
-        if(sscanf(line,"%*s %d",&status_code) == 1) {
-            if(status_code != 200 || status_code != 304) {
-                ctx->cache_ttl = 0;
-            }
-            if(status_code == 304) {
-                return 304;
-            }
-        }
-        line = strtok_r(NULL,"\r\n",&save_ptr);
-    }
-    
-    while(line) {
-        if(strncasecmp(line,"Content-Length:",15) == 0) {
-            ctx->upstream_content_length = atoi(line + 15);
-        } 
-        else if(strncasecmp(line,"Transfer-Encoding:",18) == 0) {
-            if(strstr(line + 18,"chunked") != NULL) {
-                ctx->is_chunked = 1;
-                ctx->chunk_state = 0;
-                ctx->current_chunk_bytes_read = 0;
-                ctx->hex_idx = 0;
-            }
-        } 
-        else if(strncasecmp(line,"Connection:",11) == 0) {
-            if(strcasestr(line + 11,"close") != NULL) *upstream_dropped_out = 1;
-        } 
-        else if(strncasecmp(line,"Cache-Control:",14) == 0) {
-            char* header_val = line + 14;
-            while(*header_val == ' ') header_val++;
-            if(strcasestr(header_val,"no-store")  || strcasestr(header_val,"no-cache")  || strcasestr(header_val,"private")) {
-                ctx->cache_ttl = 0; // Don't cache
-            } else {
-                char* max_age = strcasestr(header_val,"max-age");
-                if(max_age) {
-                    ctx->cache_ttl = atoi(max_age + 8);
-                }
-            }
-        }
-        else if(strncasecmp(line,"ETag:",5) == 0) {
-            char* header_val = line + 5;
-            while(*header_val == ' ') header_val++;
-            strncpy(ctx->etag,header_val,sizeof(ctx->etag) - 1);
-            ctx->etag[sizeof(ctx->etag) - 1] = '\0';
-        }
-        line = strtok_r(NULL,"\r\n",&save_ptr);
-    }
-    return 200;
-}
-
-int filter_headers_to_buffer(char* header_block,int block_len,char* headers,int offset) {
-    if (block_len < 0 || block_len >= BUFFER) return offset;
-    char* save_ptr;
-    char headers_copy[BUFFER + 1];
-    memcpy(headers_copy,header_block,block_len);
-    headers_copy[block_len] = '\0';
-
-    char* line = strtok_r(headers_copy,"\r\n",&save_ptr);
-    if(line) {
-        line = strtok_r(NULL,"\r\n",&save_ptr);
-    }
-    while(line != NULL) {
-        if(strncasecmp(line,"Connection:",11) == 0 || 
-           strncasecmp(line,"Keep-Alive:", 11) == 0 || 
-           strncasecmp(line,"Transfer-Encoding:", 18) == 0 || 
-           strncasecmp(line,"Upgrade:", 8) == 0 || 
-           strncasecmp(line,"Content-Length:",15) == 0 || 
-           strncasecmp(line,"Proxy-Connection:",17) == 0 || 
-           strncasecmp(line, "Via:", 4) == 0 || 
-           strncasecmp(line, "Age:", 4) == 0) {
-            line = strtok_r(NULL,"\r\n",&save_ptr);
-            continue;
-        }
-        offset += snprintf(headers + offset,BUFFER - offset,"%s\r\n",line);
-        line = strtok_r(NULL,"\r\n",&save_ptr);
-    }
-    offset += snprintf(headers + offset,BUFFER - offset,"\r\n");
-    return offset;
-}
-
-static char* build_response(char* upstream_headers,int upstream_header_len,char* body,long body_size, long* out_len) {
-    char hdr_buffer[BUFFER];
-    
-    int hdr_len = snprintf(hdr_buffer,sizeof(hdr_buffer),
-        "HTTP/1.1 200 OK\r\n"
-        "Connection: keep-alive\r\n"
-        "Content-Length: %ld\r\n"
-        "Via: 1.1 caching-proxy\r\n",body_size);
-
-    if (upstream_header_len > 0) {
-        memcpy(hdr_buffer + hdr_len, upstream_headers, upstream_header_len);
-        hdr_len += upstream_header_len;
-    }
-
-    long total = hdr_len + body_size;
-    char* resp = malloc(total + 1);
-    if(!resp) return NULL;
-
-    memcpy(resp,hdr_buffer,hdr_len);
-    memcpy(resp + hdr_len,body,body_size);
-    *out_len = total;
-    return resp;
-}
-
-void bypass_cache_for_waiters(char* url,CacheNode* target) {
+void bypass_cache_for_waiters(char* url,void* node) {
     unsigned long hash = hash_url(url);
     int bucket = hash % CACHE_BUCKETS;
-
-    CacheNode *current = cache_table[bucket], *prev = NULL;
+    
     pthread_rwlock_wrlock(&cache_locks[bucket]);
+    CacheNode* target = (CacheNode*)node;
+    CacheNode *current = cache_table[bucket], *prev = NULL;
     while(current != NULL) {
         if(current == target) {
 
@@ -582,6 +460,7 @@ void bypass_cache_for_waiters(char* url,CacheNode* target) {
 }
 
 void abort_cache_download(char* url,void* node_ref) {
+
     unsigned long hash = hash_url(url);
     int bucket = hash % CACHE_BUCKETS;
 
@@ -606,7 +485,7 @@ void abort_cache_download(char* url,void* node_ref) {
                 current->num_waiters = 0;
             }
             
-            if(current == target) {
+            if(current == target && target != NULL) {
                 if(prev == NULL) {
                     cache_table[bucket] = current->next;
                 } else {
@@ -623,7 +502,7 @@ void abort_cache_download(char* url,void* node_ref) {
                 current->response = NULL;
                 free(current);
                 current = NULL;
-            } else {
+            } else if(target != NULL) {
                 free(target->response);
                 target->response = NULL;
                 free(target);
@@ -930,7 +809,6 @@ int check_cache_ram(ConnectionContext* ctx) {
 
                 if(current->num_waiters < MAX_WAITERS) {
                     current->waiters[current->num_waiters++] = ctx;
-                    atomic_fetch_add(&ctx->active_threads,1);
                     pthread_rwlock_unlock(&cache_locks[bucket]);
                     return 2;
                 }
@@ -987,7 +865,7 @@ int check_cache_ram(ConnectionContext* ctx) {
 
 int check_cache(ConnectionContext* ctx) {
     int status = check_cache_ram(ctx);
-    
+
     if(status == 1 && ctx->send_mem_buf != NULL) return 1;
     else if(status == 1 && ctx->send_mem_buf == NULL) {
         char cache_file[256];
@@ -1000,169 +878,6 @@ int check_cache(ConnectionContext* ctx) {
     else if(status == 3) return -2;
 
     return 0;
-}
-
-void handle_check_cache(ConnectionContext* ctx) {
-    
-    if(ctx->checkCache) {
-        int isHit = check_cache(ctx);
-        if(isHit == 0) {
-            //CACHE MISS
-            ctx->state = STATE_CONNECT_UPSTREAM;
-            return;
-        } else if(isHit == -1) {
-            ctx->state = STATE_WAIT_CACHE;
-            return;
-        } else if(isHit == -2) {
-            //Not Modified Content
-            ctx->state = STATE_SEND_RESPONSE_HEADERS;
-            return;
-        }  else {
-            //CACHE HIT
-
-        }
-    }
-    
-    //CACHE HIT
-    acquire_cache_ref(ctx->cache_ref);
-
-    if(ctx->send_mem_buf != NULL) {
-        ctx->write_len = 0;
-        ctx->write_offset = 0;
-        int offset = ctx->send_mem_offset;
-        memcpy(ctx->write_buf,ctx->send_mem_buf,offset);
-        ctx->write_len = offset;
-
-        if(ctx->checkCache) {
-            ctx->write_len -= 2;
-            long age_seconds = time(NULL) - ctx->cached_at;
-            ctx->write_len += snprintf(ctx->write_buf + ctx->write_len,sizeof(ctx->write_buf) - ctx->write_len,
-                          "X-Cache: HIT\r\n"
-                          "Age:%ld\r\n"
-                          "\r\n",age_seconds);
-        }
-
-        ctx->state = STATE_SEND_RESPONSE_HEADERS;
-        return;
-    }
-    
-    int cork = 1;
-    setsockopt(ctx->client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
-    ctx->write_len = 0;
-    ctx->write_offset = 0;
-    ctx->write_len += snprintf(ctx->write_buf, sizeof(ctx->write_buf),
-            "HTTP/1.1 200 OK\r\n"
-            "Connection: keep-alive\r\n"
-            "Content-Length: %ld\r\n"
-            "Via: 1.1 c_proxy\r\n",
-            ctx->bytes_remaining);
-    
-    if(ctx->checkCache) {
-        long age_seconds = time(NULL) - ctx->cached_at;
-        ctx->write_len += snprintf(ctx->write_buf + ctx->write_len,sizeof(ctx->write_buf) - ctx->write_len,
-                          "X-Cache: HIT\r\n"
-                          "Age:%ld\r\n",age_seconds);
-    }
-    
-    char file_buffer[BUFFER];
-    read(ctx->file_fd,file_buffer,sizeof(file_buffer));
-    memcpy(ctx->write_buf + ctx->write_len, file_buffer + sizeof(CacheHeader), ctx->upstream_header_len);
-    ctx->write_len += ctx->upstream_header_len;
-    long body_offset = sizeof(CacheHeader) + ctx->upstream_header_len;
-    ctx->send_mem_buf = NULL;
-    lseek(ctx->file_fd,body_offset,SEEK_SET);
-    ctx->state = STATE_SEND_RESPONSE_HEADERS;
-    return;
-}
-
-void handle_send_cache(ConnectionContext *ctx) {
-    if(ctx->send_mem_buf != NULL) {
-        while(ctx->send_mem_offset < ctx->send_mem_len) {
-            long bytes_sent = send(ctx->client_fd,ctx->send_mem_buf + ctx->send_mem_offset, 
-                                 ctx->send_mem_len - ctx->send_mem_offset,MSG_NOSIGNAL);
-            if(bytes_sent < 0) {
-                if(errno == EWOULDBLOCK || errno == EAGAIN) {
-                    return;
-                }
-
-                if(errno == EPIPE || errno == ECONNRESET) {
-                    ctx->state = STATE_CLOSE;
-                    return;
-                }
-                perror("send failure");
-                ctx->state = STATE_CLOSE;
-                return;
-            } else if(bytes_sent == 0) {
-                ctx->state = STATE_CLOSE;
-                return;
-            } 
-            atomic_store(&ctx->last_active,time(NULL));
-            ctx->send_mem_offset += bytes_sent;
-        }
-
-        ctx->send_mem_buf = NULL;
-        ctx->send_mem_len = 0;
-        ctx->send_mem_offset = 0;
-    } else {
-        while(ctx->bytes_remaining > 0) {
-            ssize_t bytes_sent = sendfile(ctx->client_fd, ctx->file_fd, NULL , ctx->bytes_remaining);
-            if (bytes_sent < 0) {
-                if(errno == EWOULDBLOCK || errno == EAGAIN) {
-                    return;
-                }
-
-                if(errno == EPIPE || errno == ECONNRESET) {
-                    ctx->state = STATE_CLOSE;
-                    return;
-                }
-                
-                perror("sendfile failed");
-                ctx->state = STATE_CLOSE;
-                return;
-            } else if(bytes_sent == 0) {
-                ctx->state = STATE_CLOSE;
-                return;
-            }
-            atomic_store(&ctx->last_active,time(NULL));
-            ctx->bytes_remaining -= bytes_sent;
-        }
-
-        close(ctx->file_fd);
-        ctx->file_fd = -1;
-
-        int cork = 0;
-        setsockopt(ctx->client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
-    }
-    
-    release_cache_ref(ctx->cache_ref);
-    ctx->cache_ref = NULL;
-
-    if(ctx->keep_alive) {
-        ctx->bytes_read = 0;
-
-        ctx->write_len = 0;
-        ctx->write_offset = 0;
-        ctx->bytes_remaining = 0;
-
-        ctx->upstream_header_len = 0;
-        ctx->upstream_headers_parsed = 0;
-        ctx->upstream_content_length = 0;
-        ctx->upstream_body_downloaded = 0;
-        ctx->is_chunked = 0;
-        ctx->chunk_state = 0;
-        ctx->header_overshoot_len = 0;
-
-        ctx->checkCache = 0;
-        ctx->read_buf[0] = '\0';
-        ctx->method[0] = '\0';
-        ctx->url[0] = '\0';
-        ctx->protocol[0] = '\0';
-        ctx->req.hostname[0] = '\0';
-        ctx->req.path[0] = '\0';
-        ctx->state = STATE_READ_REQUEST;
-    } else {
-        ctx->state = STATE_CLOSE;
-    }
 }
 
 void cache_not_modified(ConnectionContext* ctx) {
@@ -1185,14 +900,12 @@ void cache_not_modified(ConnectionContext* ctx) {
                 ctx->cached_at = current->cached_at;
                 ctx->cache_ref = current;
                 atomic_store(&current->last_accessed,time(NULL));
-                return;
             } else if(current->is_large) {
                 ctx->bytes_remaining = current->body_size;
                 ctx->upstream_header_len = current->upstream_header_len;
                 ctx->send_mem_buf = NULL;
                 ctx->cached_at = current->cached_at;
                 ctx->cache_ref = current;
-                return;
             }
             
             ConnectionContext* temp_waiters[MAX_WAITERS];
@@ -1239,389 +952,6 @@ void cache_not_modified(ConnectionContext* ctx) {
     }
     pthread_rwlock_unlock(&cache_locks[bucket]);
     return;
-}
-
-void handle_fetch_upstream(ConnectionContext* ctx) {
-    int upstream_dropped = 0;
-    while(1) {
-        if(!ctx->upstream_headers_parsed) {
-
-            if(ctx->upstream_header_len >= BUFFER - 1) {
-                perror("Upstream Headers too large: exceeded limit");
-                ctx->state = STATE_CLOSE;
-                return;
-            }
-
-            int n = recv(ctx->upstream_fd,ctx->upstream_header_buf + ctx->upstream_header_len,BUFFER - 1 - ctx->upstream_header_len,MSG_NOSIGNAL);
-
-            if(n < 0) {
-                if(errno == EWOULDBLOCK || errno == EAGAIN) return;
-
-                int current_errors = atomic_fetch_add(&consecutive_upstream_errors, 1) + 1;
-                log_event(LEVEL_ERROR, ctx->req_id, ctx->client_ip, "Origin recv() error. Strike issued.");
-
-                ctx->state = STATE_CLOSE;
-                return;
-            } else if(n == 0) {
-
-                if (ctx->upstream_headers_parsed == 0) {
-                    int current_errors = atomic_fetch_add(&consecutive_upstream_errors, 1) + 1;
-                    log_event(LEVEL_ERROR, ctx->req_id, ctx->client_ip, "Origin hung up early. Strike issued.");
-                }
-
-                upstream_dropped = 1;
-                break;
-            }
-
-            if(ctx->upstream_header_len == 0 && n > 0) {
-                struct timeval now;
-                gettimeofday(&now,NULL);
-                
-                atomic_store(&consecutive_upstream_errors,0);
-                uint64_t time_elapsed_us = (now.tv_sec - ctx->upstream_send_time.tv_sec) * 1000000ULL + (now.tv_usec - ctx->upstream_send_time.tv_usec);
-
-                uint64_t current_ema = atomic_load(&global_upstream_latency_us);
-                uint64_t new_ema = (current_ema * 9 + time_elapsed_us) / 10;
-                atomic_store(&global_upstream_latency_us,new_ema);
-            }
-
-            atomic_store(&ctx->last_active,time(NULL));
-            ctx->upstream_header_len += n;
-            ctx->upstream_header_buf[ctx->upstream_header_len] = '\0';
-            char* body_ptr = strstr(ctx->upstream_header_buf,"\r\n\r\n");
-            if(body_ptr != NULL) {
-                body_ptr += 4;
-                int status_code = parse_upstream_headers(ctx,body_ptr,&upstream_dropped);
-                
-                if(status_code == 304) {
-                    cache_not_modified(ctx);
-                    ctx->checkCache = 0;
-                    ctx->state = STATE_CHECK_CACHE;
-                    return;
-                }
-
-                if(ctx->upstream_content_length > global_config.large_file_threshold) {
-                    char cache_file[256],temp_file[300];
-                    get_cache_filename(ctx->url,cache_file);
-                    snprintf(temp_file,sizeof(temp_file),"%s.tmp.%d",cache_file,ctx->client_fd);
-                    ctx->file_fd = open(temp_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                } else {
-                    ctx->file_fd = memfd_create("data-stream",0);
-
-                    if(ctx->file_fd < 0) {
-                        FILE* temp = tmpfile();
-                        if(temp) {
-                            ctx->file_fd = dup(fileno(temp));
-                            fclose(temp);
-                        }
-                    }
-                }
-                
-                if(ctx->file_fd < 0) {
-                    perror("Denied File Descriptor Allocation");
-                    ctx->state = STATE_CLOSE;
-                    return;
-                }
-                CacheHeader dummyHeader;
-                memset(&dummyHeader,0,sizeof(dummyHeader));
-                write(ctx->file_fd,&dummyHeader,sizeof(dummyHeader));
-
-                int headers_len = body_ptr - ctx->upstream_header_buf;
-                ctx->header_overshoot_len = ctx->upstream_header_len - headers_len;
-                
-                char filtered_headers[BUFFER];
-                int filtered_len = filter_headers_to_buffer(ctx->upstream_header_buf, headers_len, filtered_headers, 0);
-                
-                write(ctx->file_fd, filtered_headers, filtered_len);
-                ctx->upstream_header_len = filtered_len;
-
-                if(ctx->header_overshoot_len > 0) {
-                    memcpy(ctx->header_overshoot_buf,body_ptr,ctx->header_overshoot_len);
-                }
-
-                ctx->upstream_headers_parsed = 1;
-                continue;
-            }
-        } else {
-            
-            char temp_buf[BUFFER];
-            int n; 
-            
-            if(ctx->header_overshoot_len > 0) {
-                memcpy(temp_buf,ctx->header_overshoot_buf,ctx->header_overshoot_len);
-                n = ctx->header_overshoot_len;
-                ctx->header_overshoot_len = 0;
-            } else {
-                n = recv(ctx->upstream_fd, temp_buf,BUFFER - 1,MSG_NOSIGNAL);
-
-                if(n < 0) {
-                    if(errno == EWOULDBLOCK || errno == EAGAIN) return;
-                    ctx->state = STATE_CLOSE;
-                    return;
-                } else if(n == 0) {
-                    upstream_dropped = 1;
-                    break;
-                }
-                atomic_store(&ctx->last_active,time(NULL));
-            }
-            
-            if(ctx->is_chunked) {
-                int i = 0;
-                while(i < n && ctx->chunk_state != 3) {
-                    if(ctx->chunk_state == 0) {
-                        char c = temp_buf[i++];
-                        if(c == '\r') continue;
-
-                        if(c == '\n') {
-                            ctx->hex_buf[ctx->hex_idx] = '\0';
-                            ctx->current_chunk_size = strtol(ctx->hex_buf,NULL,16);
-                            ctx->hex_idx = 0;
-
-                            if(ctx->current_chunk_size == 0) {
-                                ctx->chunk_state = 3;
-                            } else {
-                                ctx->chunk_state = 1;
-                                ctx->current_chunk_bytes_read = 0;
-                            }
-                        } else {
-                            if(ctx->hex_idx < 31) ctx->hex_buf[ctx->hex_idx++] = c;
-                        }   
-                    } else if(ctx->chunk_state == 1) {
-                        long to_read = ctx->current_chunk_size - ctx->current_chunk_bytes_read;
-                        long availiable = n - i;
-                        long write_len = (availiable < to_read) ? availiable : to_read;
-
-                        if(write(ctx->file_fd,temp_buf + i,write_len) != write_len) {
-                            perror("Disk Write Failure");
-                            ctx->state = STATE_CLOSE;
-                            return;
-                        }
-
-                        ctx->current_chunk_bytes_read += write_len;
-                        ctx->upstream_body_downloaded += write_len;
-                        i += write_len;
-                        
-                        if(!ctx->is_spooled_disk) {
-                            if((ctx->upstream_header_len + ctx->upstream_body_downloaded) > global_config.large_file_threshold) {
-                                char cache_file[256],temp_file[300];
-                                get_cache_filename(ctx->url,cache_file);
-                                snprintf(temp_file,sizeof(temp_file),"%s.tmp.%d",cache_file,ctx->client_fd);
-                                
-                                char log_buf[128];
-                                snprintf(log_buf,sizeof(log_buf),"Large File Requested Switching to disk transfer");
-                                log_event(LEVEL_INFO,ctx->req_id,ctx->client_ip,log_buf);
-
-                                int physical_fd = open(temp_file,O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                                if(physical_fd >= 0) { 
-                                    
-                                    lseek(ctx->file_fd,0,SEEK_SET);
-                                    char copy_buffer[BUFFER];
-                                    long bytes_r = 0;
-                                    int io_error = 0;
-                                    while((bytes_r = read(ctx->file_fd,copy_buffer,sizeof(copy_buffer))) > 0) {
-                                        if(write(physical_fd,copy_buffer,bytes_r) != bytes_r) {
-                                            io_error = 1;
-                                            break;
-                                        }
-                                    }
-                                    
-                                    if(bytes_r < 0) {
-                                        io_error = 1;
-                                    }
-
-                                    if(io_error) {
-                                        char log_buf[128];
-                                        snprintf(log_buf,sizeof(log_buf),"I/O Error while switching to disk transfer");
-                                        log_event(LEVEL_ERROR,ctx->req_id,ctx->client_ip,log_buf);
-                                        unlink(temp_file);
-                                        close(physical_fd);
-                                        ctx->state = STATE_CLOSE;
-                                        return;
-                                    }
-
-                                    close(ctx->file_fd);
-                                    ctx->file_fd = physical_fd;
-                                    ctx->is_spooled_disk = 1;
-                                }
-                            }
-                        }
-
-                        if(ctx->current_chunk_bytes_read == ctx->current_chunk_size) {
-                            ctx->chunk_state = 2;
-                        }
-
-                    } else if(ctx->chunk_state == 2) {
-                        char c = temp_buf[i++];
-                        if(c == '\n') {
-                             ctx->chunk_state = 0;
-                        }
-                    }
-                }
-
-                if(ctx->chunk_state == 3) {
-                    break;
-                }
-            } else {
-                if(write(ctx->file_fd,temp_buf,n) < 0) {
-                    perror("Disk Write Error");
-                    ctx->state = STATE_CLOSE;
-                    return;
-                }
-                ctx->upstream_body_downloaded += n;
-                if(ctx->upstream_content_length > 0 && ctx->upstream_body_downloaded >= ctx->upstream_content_length) {
-                    break;
-                }
-            }
-        }
-    }
-    
-    epoll_ctl(epoll_fd,EPOLL_CTL_DEL,ctx->upstream_fd,NULL);
-    atomic_store(&context_table[ctx->upstream_fd],NULL);
-    
-    if(upstream_dropped) {
-        atomic_fetch_sub(&active_upstream_connections,1);
-        close(ctx->upstream_fd);
-    } else {
-        stash_connection(ctx->upstream_fd,(ctx->req).hostname,(ctx->req).port);
-    }
-    ctx->upstream_fd = -1;
-
-    char cache_file[256],temp_file[300];
-    get_cache_filename(ctx->url,cache_file);
-    snprintf(temp_file, sizeof(temp_file), "%s.tmp.%d", cache_file, ctx->client_fd);
-    
-    if(!ctx->upstream_headers_parsed) {
-        if(ctx->file_fd != -1) {
-            close(ctx->file_fd);
-            ctx->file_fd = -1;
-            unlink(temp_file);
-        }
-        ctx->state = STATE_CLOSE;
-        return;
-    }
-
-    
-    if(ctx->upstream_content_length > 0 && ctx->upstream_body_downloaded < ctx->upstream_content_length) {
-        close(ctx->file_fd);
-        ctx->file_fd = -1;
-        unlink(temp_file);
-        ctx->state = STATE_CLOSE;
-        return;
-    }
-    
-    if(ctx->is_chunked && ctx->chunk_state != 3) {
-        close(ctx->file_fd);
-        ctx->file_fd = -1;
-        unlink(temp_file);
-        ctx->state = STATE_CLOSE;
-        return;
-    }
-
-    CacheHeader finalHeader;
-    memset(&finalHeader,0,sizeof(CacheHeader));
-    strncpy(finalHeader.url,ctx->url,sizeof(finalHeader.url) - 1);
-    finalHeader.url[sizeof(finalHeader.url) - 1] = '\0';
-    if(strlen(ctx->etag) > 0) {
-        strncpy(finalHeader.etag,ctx->etag,sizeof(finalHeader.etag) - 1);
-        finalHeader.etag[sizeof(finalHeader.etag) - 1] = '\0';
-    }
-    finalHeader.expires_at = time(NULL) + ctx->cache_ttl;
-    finalHeader.cached_at = time(NULL);
-
-    struct stat st;
-    fstat(ctx->file_fd,&st);
-    finalHeader.content_length = st.st_size - sizeof(CacheHeader);
-    ctx->bytes_remaining = finalHeader.content_length - ctx->upstream_header_len;
-    finalHeader.upstream_header_len = ctx->upstream_header_len;
-    
-    long body_size = finalHeader.content_length - ctx->upstream_header_len;
-
-    lseek(ctx->file_fd,0,SEEK_SET);
-    write(ctx->file_fd,&finalHeader,sizeof(finalHeader));
-
-
-    if(ctx->cache_ttl <= 0) {
-        
-        lseek(ctx->file_fd, 0, SEEK_SET);
-
-        if(ctx->is_designated_downloader) {
-            bypass_cache_for_waiters(ctx->url,(CacheNode*)ctx->cache_ref);
-            ctx->is_designated_downloader = 0;
-        }
-
-        ctx->send_mem_buf = NULL;
-        ctx->checkCache = 0;
-        ctx->state = STATE_CHECK_CACHE;
-        return;
-    }
-    
-    int read_fd = -1;
-    if(ctx->upstream_body_downloaded >= global_config.large_file_threshold) {
-        close(ctx->file_fd);
-        ctx->file_fd = -1;
-        if(rename(temp_file,cache_file) != 0) {
-            ctx->state = STATE_CLOSE;
-        }
-
-        read_fd = open(cache_file,O_RDONLY);
-        if(read_fd < 0) {ctx->state = STATE_CLOSE; return;}
-    } else {
-        read_fd = ctx->file_fd;
-        ctx->file_fd = -1;
-    }
-
-
-    char file_buf[BUFFER];
-    lseek(read_fd,sizeof(CacheHeader),SEEK_SET);
-    int hdr_read = read(read_fd,file_buf,ctx->upstream_header_len);
-    if(hdr_read < ctx->upstream_header_len) {
-        ctx->state = STATE_CLOSE;
-        close(read_fd);
-        read_fd = -1;
-        return;
-    }
-    
-    if(body_size < global_config.large_file_threshold) {
-        char* body_buf = malloc(body_size);
-        if(body_buf) {
-            long total_read = 0;
-            while(total_read < body_size) {
-                int r = read(read_fd,body_buf + total_read, body_size - total_read);
-                if(r <= 0) { 
-                    close(read_fd);
-                    free(body_buf);
-                    ctx->state = STATE_CLOSE; 
-                    return;
-                }
-                total_read += r;
-            }
-            int cache_status = add_to_cache_ram(ctx,ctx->url, finalHeader.expires_at,finalHeader.cached_at,file_buf, ctx->upstream_header_len,body_buf, body_size);
-            if(cache_status <= 0) {
-                close(read_fd);
-                ctx->state = STATE_CLOSE;
-                return;
-            }
-            ctx->is_designated_downloader = 0;
-            free(body_buf);
-        }
-        close(read_fd);
-
-        ctx->checkCache = 0;
-        ctx->state = STATE_CHECK_CACHE;
-        return;
-    } else {
-        add_to_cache_ram(NULL,ctx->url, finalHeader.expires_at,finalHeader.cached_at,file_buf, ctx->upstream_header_len,NULL, body_size);
-        ctx->is_designated_downloader = 0;
-        close(read_fd);
-
-        ctx->file_fd = open(cache_file,O_RDONLY);
-        if(ctx->file_fd < 0) { ctx->state = STATE_CLOSE;  return; }
-        lseek(ctx->file_fd, sizeof(CacheHeader), SEEK_SET);
-        ctx->checkCache = 0;
-        ctx->send_mem_buf = NULL;
-        ctx->state = STATE_CHECK_CACHE;
-        return;
-    }
 }
 
 void rehydrate_cache() {
@@ -1690,7 +1020,7 @@ void rehydrate_cache() {
                                 free(payload);
                                 free(node);
                                 payload_read = 0;
-                                break;
+                                continue;
                             }
                             payload_read += r;
                         }

@@ -1,48 +1,5 @@
-#ifndef PROXY_H
-#define PROXY_H
-
-#include<netinet/in.h>
-#include <pthread.h>
-#include <stdatomic.h>
-#include"proxy_log.h"
-
-#define NUM_REACTORS sysconf(_SC_NPROCESSORS_ONLN)
-
-typedef struct {
-    int port;
-    int backlog;
-    int buffer;
-    int max_fds;
-    int epoll_batch_size;
-    int pool_buckets;
-    int pool_max_connections;
-    int idle_timeout_sec;
-    int latency_upstream_threshold;
-    int cooldown_sec;
-    int max_consecutive_errors;
-    int max_cache_mem;
-    int large_file_threshold;
-    int default_ttl;
-    int cache_buckets;
-    int max_waiters;
-    int expiry_interval;
-    int prefetch_threshold;
-    int prefetch_window;
-    int rate_limiter_capacity;
-    int refill_rate;
-    int client_timeout;
-    int cleanup_interval;
-    int hash_table_size;
-    LogLevel log_level;
-    int log_queue_size;
-    int max_log_msg;
-    int log_batch_size;
-} ProxyConfig;
-
-extern ProxyConfig global_config;
-void load_config(const char* filename);
-
-#define BUFFER 8192
+#ifndef CONNECTION_H
+#define CONNECTION_H
 
 struct ProxyRequest {
     char hostname[256];
@@ -64,8 +21,6 @@ typedef enum {
     STATE_TUNNELING,         // Handling POST requests
     STATE_CLOSE              // Connection is dead, clean up memory
 } ConnectionState;
-
-
 
 typedef struct ConnectionContext {
     int client_fd;         
@@ -109,7 +64,6 @@ typedef struct ConnectionContext {
     char protocol[16];
     struct ProxyRequest req;
     
-    _Atomic int active_threads; 
     pthread_mutex_t state_lock;
     
     int file_fd;            
@@ -134,38 +88,8 @@ typedef struct ConnectionContext {
     char etag[256];
     char client_if_none_match[256];
     int revalidating;
+    int is_reused_upstream;
+    int is_error;
 } ConnectionContext;
 
-typedef struct ConnectionNode {
-    int fd;
-    struct ConnectionNode* next;
-} ConnectionNode;
-
-typedef struct HostEntry{
-    char hostname[256];
-    int port;
-    ConnectionNode* fd_head;   
-    struct HostEntry* next_host;      
-} HostEntry;
-
-typedef struct HostBucket{
-    HostEntry* head;
-    pthread_mutex_t bucket_lock;
-}HostBucket;
-
-
-typedef struct {
-    int reactor_id;
-    int epoll_fd;
-    int wakeup_fd;         // eventfd used for signalling
-    ConnectionContext* task_head;
-    ConnectionContext* task_tail;
-    pthread_mutex_t task_lock;
-    _Atomic int wakeup_pending;
-} Reactor;
-
-
-void* handle_state_machine(void* args);
-
-int parse_url(char*,struct ProxyRequest*);
 #endif

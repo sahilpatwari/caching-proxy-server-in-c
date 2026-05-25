@@ -24,7 +24,7 @@ static int shutdown_flag = 0;
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t log_notify = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t log_space = PTHREAD_COND_INITIALIZER;
-static pthread_t log_worker_thread;
+static pthread_t logger_worker_thread;
 
 static FILE* log_file = NULL;
 static LogLevel current_level = LEVEL_INFO; // Default to INFO
@@ -72,7 +72,7 @@ void init_log(LogLevel level) {
     current_level = level;
     shutdown_flag = 0;
 
-    if(pthread_create(&log_worker_thread,NULL,logger_worker,NULL) != 0) {
+    if(pthread_create(&logger_worker_thread,NULL,logger_worker,NULL) != 0) {
         perror("Failed to create logger worker thread");
     }
 }
@@ -130,7 +130,7 @@ void close_log() {
     pthread_cond_broadcast(&log_space);
     pthread_mutex_unlock(&log_lock);
 
-    pthread_join(log_worker_thread,NULL);
+    pthread_join(logger_worker_thread,NULL);
 
     if(log_file) {
         fclose(log_file);
